@@ -1,3 +1,6 @@
+import math
+import time
+
 import numpy as np
 
 import taichi as ti
@@ -7,8 +10,8 @@ ti.init(arch=ti.gpu)
 # dim, n_grid, steps, dt = 2, 128, 20, 2e-4
 # dim, n_grid, steps, dt = 2, 256, 32, 1e-4
 # dim, n_grid, steps, dt = 3, 32, 25, 4e-4
-dim, n_grid, steps, dt = 3, 64, 25, 2e-4
-# dim, n_grid, steps, dt = 3, 128, 5, 1e-4
+# dim, n_grid, steps, dt = 3, 64, 25, 2e-4
+dim, n_grid, steps, dt = 3, 128, 25, 1e-4
 
 n_particles = n_grid**dim // 2 ** (dim - 1)
 
@@ -223,9 +226,9 @@ presets = [
         CubeVolume(ti.Vector([0.05, 0.6, 0.05]), ti.Vector([0.25, 0.25, 0.25]), JELLY),
     ],
     [
-        CubeVolume(ti.Vector([0.15, 0.05, 0.15]), ti.Vector([0.25, 0.35, 0.25]), JELLY),
-        CubeVolume(ti.Vector([0.45, 0.05, 0.45]), ti.Vector([0.25, 0.35, 0.25]), SNOW),
-        CubeVolume(ti.Vector([0.7, 0.05, 0.7]), ti.Vector([0.25, 0.35, 0.25]), CONCRETE),
+        CubeVolume(ti.Vector([0.6, 0.05, 0.6]), ti.Vector([0.25, 0.25, 0.25]), JELLY),
+        CubeVolume(ti.Vector([0.35, 0.35, 0.35]), ti.Vector([0.25, 0.25, 0.25]), SNOW),
+        CubeVolume(ti.Vector([0.35, 0.6, 0.35]), ti.Vector([0.25, 0.25, 0.25]), CONCRETE),
     ],
 ]
 preset_names = [
@@ -271,6 +274,129 @@ camera.lookat(0.5, 0.3, 0.5)
 camera.fov(55)
 
 
+class OrbitCameraController:
+    def __init__(self, camera):
+        self.camera = camera
+        self.center = np.array(camera.curr_lookat, dtype=np.float32)
+        offset = np.array(camera.curr_position, dtype=np.float32) - self.center
+        self.distance = max(float(np.linalg.norm(offset)), 1e-3)
+        self.azimuth = float(np.arctan2(offset[0], offset[2]))
+        ratio = offset[1] / self.distance if self.distance > 1e-6 else 0.0
+        self.elevation = float(np.arcsin(np.clip(ratio, -0.999, 0.999)))
+        self.rotation_speed = 2.0 * math.pi
+        self.pan_speed = 1.5
+        self.zoom_speed = 2.5
+        self.keyboard_speed = 2.0
+        self.min_distance = 0.1
+        self.max_distance = 20.0
+        self.drag_mode = None
+        self.last_cursor = None
+        self.last_time = time.perf_counter()
+
+    @staticmethod
+    def _normalize(vec):
+        norm = float(np.linalg.norm(vec))
+        if norm < 1e-6:
+            return np.zeros(3, dtype=np.float32)
+        return vec / norm
+
+    def _compute_position(self):
+        cos_elev = math.cos(self.elevation)
+        return self.center + np.array(
+            [
+                self.distance * math.sin(self.azimuth) * cos_elev,
+                self.distance * math.sin(self.elevation),
+                self.distance * math.cos(self.azimuth) * cos_elev,
+            ],
+            dtype=np.float32,
+        )
+
+    def update(self, window):
+        now = time.perf_counter()
+        dt = max(now - self.last_time, 1e-6)
+        self.last_time = now
+
+        cursor = np.array(window.get_cursor_pos(), dtype=np.float32)
+        position = self._compute_position()
+        forward = self._normalize(self.center - position)
+        if not np.any(forward):
+            forward = np.array([0.0, 0.0, -1.0], dtype=np.float32)
+        right = self._normalize(np.cross(forward, np.array([0.0, 1.0, 0.0], dtype=np.float32)))
+        if not np.any(right):
+            right = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        up = self._normalize(np.cross(right, forward))
+        if not np.any(up):
+            up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+
+        move = np.zeros(3, dtype=np.float32)
+        if window.is_pressed("w"):
+            move += forward
+        if window.is_pressed("s"):
+            move -= forward
+        if window.is_pressed("a"):
+            move -= right
+        if window.is_pressed("d"):
+            move += right
+        if window.is_pressed("e"):
+            move += up
+        if window.is_pressed("q"):
+            move -= up
+        if np.linalg.norm(move) > 1e-6:
+            move = self._normalize(move)
+            self.center += move * self.keyboard_speed * dt * max(self.distance, 0.1)
+
+        mode = None
+        if window.is_pressed(ti.ui.RMB):
+            if window.is_pressed(ti.ui.CTRL):
+                mode = "zoom"
+            elif window.is_pressed(ti.ui.SHIFT):
+                mode = "pan"
+            else:
+                mode = "orbit"
+        elif window.is_pressed(ti.ui.MMB):
+            mode = "pan"
+
+        if mode is None:
+            self.drag_mode = None
+            self.last_cursor = cursor
+        else:
+            if self.drag_mode != mode or self.last_cursor is None:
+                self.drag_mode = mode
+                self.last_cursor = cursor
+            dx = cursor[0] - self.last_cursor[0]
+            dy = cursor[1] - self.last_cursor[1]
+            if mode == "orbit":
+                self.azimuth -= dx * self.rotation_speed
+                self.elevation += dy * self.rotation_speed
+                limit = math.pi * 0.49
+                self.elevation = float(np.clip(self.elevation, -limit, limit))
+            elif mode == "pan":
+                pan_scale = self.pan_speed * self.distance
+                self.center += (-right * dx + up * dy) * pan_scale
+            elif mode == "zoom":
+                zoom_scale = math.exp(dy * self.zoom_speed)
+                self.distance = float(np.clip(self.distance * zoom_scale, self.min_distance, self.max_distance))
+            self.last_cursor = cursor
+
+        self.distance = float(np.clip(self.distance, self.min_distance, self.max_distance))
+
+        new_position = self._compute_position()
+        new_forward = self._normalize(self.center - new_position)
+        if not np.any(new_forward):
+            new_forward = forward
+        new_right = self._normalize(np.cross(new_forward, np.array([0.0, 1.0, 0.0], dtype=np.float32)))
+        if not np.any(new_right):
+            new_right = right
+        new_up = self._normalize(np.cross(new_right, new_forward))
+        if not np.any(new_up):
+            new_up = up
+
+        self.camera.position(*new_position)
+        self.camera.lookat(*self.center)
+        self.camera.up(*new_up)
+
+camera_controller = OrbitCameraController(camera)
+
 def show_options():
     global use_random_colors
     global paused
@@ -313,7 +439,7 @@ def show_options():
 
 
 def render():
-    camera.track_user_inputs(window, movement_speed=0.03, hold_key=ti.ui.RMB)
+    camera_controller.update(window)
     scene.set_camera(camera)
 
     scene.ambient_light((0, 0, 0))
