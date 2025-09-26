@@ -9,10 +9,13 @@ ti.init(arch=ti.gpu)
 
 # Simulation configuration (SI units)
 DIM = 3
-GRID_RESOLUTION = 96  # cells per edge; increase with SIMULATION_LENGTH to keep resolution
-SUBSTEPS_PER_FRAME = 20
-MAX_SUBSTEP_DT = 1.2e-4
+REFERENCE_SIMULATION_LENGTH = 1.0  # metres, canonical domain edge length
 SIMULATION_LENGTH = 1.0  # metres, edge length of the cubic domain
+SIMULATION_SCALE = max(SIMULATION_LENGTH / REFERENCE_SIMULATION_LENGTH, 1e-6)
+MATERIAL_STIFFNESS_SCALE = max(SIMULATION_SCALE, 1.0)
+PLASTIC_STRETCH_SCALE = 1.0 / MATERIAL_STIFFNESS_SCALE
+GRID_RESOLUTION = 96  # cells along each edge at the reference scale
+SUBSTEPS_PER_FRAME = 20
 PACKING_FRACTION = 0.5  # fraction of cell size used for initial particle spacing
 BASE_DENSITY = 1000.0  # kg/m^3
 BASE_YOUNG_MODULUS = 1.0e5  # Pa
@@ -20,25 +23,39 @@ POISSON_RATIO = 0.2
 GRAVITY = [0.0, -9.81, 0.0]  # m/s^2
 BOUNDARY_CELLS = 3
 CFL_NUMBER = 0.5
+MAX_SUBSTEP_DT_BASE = 1.2e-4
+MAX_SUBSTEP_DT = MAX_SUBSTEP_DT_BASE / math.sqrt(MATERIAL_STIFFNESS_SCALE)
 
-WATER_STIFFNESS_MULTIPLIER = 1.5
+BASE_WATER_STIFFNESS_MULTIPLIER = 1.5
+BASE_JELLY_HARDENING = 0.35
+BASE_JELLY_STIFFNESS_MULTIPLIER = 0.85
+BASE_SNOW_STIFFNESS_MULTIPLIER = 2.2
+BASE_CONCRETE_HARDENING_MULTIPLIER = 12.0
+BASE_CONCRETE_STIFFNESS_MULTIPLIER = 4.0
+CONCRETE_PLASTIC_COMPRESSIVE = 5.0e-4
+CONCRETE_PLASTIC_TENSILE = 8.0e-4
+
+WATER_STIFFNESS_MULTIPLIER = BASE_WATER_STIFFNESS_MULTIPLIER * MATERIAL_STIFFNESS_SCALE
+JELLY_HARDENING = BASE_JELLY_HARDENING * math.sqrt(MATERIAL_STIFFNESS_SCALE)
+JELLY_STIFFNESS_MULTIPLIER = BASE_JELLY_STIFFNESS_MULTIPLIER * MATERIAL_STIFFNESS_SCALE
+SNOW_STIFFNESS_MULTIPLIER = BASE_SNOW_STIFFNESS_MULTIPLIER * MATERIAL_STIFFNESS_SCALE
+CONCRETE_HARDENING_MULTIPLIER = BASE_CONCRETE_HARDENING_MULTIPLIER * MATERIAL_STIFFNESS_SCALE
+CONCRETE_STIFFNESS_MULTIPLIER = BASE_CONCRETE_STIFFNESS_MULTIPLIER * MATERIAL_STIFFNESS_SCALE
+CONCRETE_MIN_PLASTIC_STRETCH = 1.0 - CONCRETE_PLASTIC_COMPRESSIVE * PLASTIC_STRETCH_SCALE
+CONCRETE_MAX_PLASTIC_STRETCH = 1.0 + CONCRETE_PLASTIC_TENSILE * PLASTIC_STRETCH_SCALE
+
 WATER_DAMPING_PER_SECOND = 0.999
-JELLY_HARDENING = 0.35
-JELLY_STIFFNESS_MULTIPLIER = 0.85
-JELLY_DAMPING_PER_SECOND = 0.9
-SNOW_STIFFNESS_MULTIPLIER = 2.2
+JELLY_DAMPING_PER_SECOND = 0.92
 SNOW_DAMPING_PER_SECOND = 0.995
-CONCRETE_HARDENING_MULTIPLIER = 12.0
-CONCRETE_STIFFNESS_MULTIPLIER = 4.0
-CONCRETE_DAMPING_PER_SECOND = 0.98
-CONCRETE_MIN_PLASTIC_STRETCH = 1.0 - 1.5e-3
-CONCRETE_MAX_PLASTIC_STRETCH = 1.0 + 1.5e-3
+CONCRETE_DAMPING_PER_SECOND = 0.985
 
 DEFAULT_PARTICLE_RADIUS = 0.02 * SIMULATION_LENGTH
 MAX_PARTICLE_RADIUS = 0.1 * SIMULATION_LENGTH
 
+
 dim = DIM
 n_grid = GRID_RESOLUTION
+
 
 dx = SIMULATION_LENGTH / n_grid
 
@@ -87,6 +104,81 @@ def domain_scalar(value):
 
 def domain_vector(values):
     return ti.Vector(values) * SIMULATION_LENGTH
+
+
+WORLD_GRID_DIVISIONS = 10
+
+
+def build_world_grid_geometry(divisions):
+    if divisions <= 0:
+        return np.zeros((0, 3), dtype=np.float32)
+    vertices = []
+
+    def add_line(start_frac, end_frac):
+        start = np.array(start_frac, dtype=np.float32) * SIMULATION_LENGTH
+        end = np.array(end_frac, dtype=np.float32) * SIMULATION_LENGTH
+        vertices.append(start)
+        vertices.append(end)
+
+    corners = [
+        (0.0, 0.0, 0.0),
+        (1.0, 0.0, 0.0),
+        (1.0, 0.0, 1.0),
+        (0.0, 0.0, 1.0),
+        (0.0, 1.0, 0.0),
+        (1.0, 1.0, 0.0),
+        (1.0, 1.0, 1.0),
+        (0.0, 1.0, 1.0),
+    ]
+    edges = [
+        (0, 1), (1, 2), (2, 3), (3, 0),  # bottom
+        (4, 5), (5, 6), (6, 7), (7, 4),  # top
+        (0, 4), (1, 5), (2, 6), (3, 7),  # verticals
+    ]
+    for a, b in edges:
+        add_line(corners[a], corners[b])
+
+    for i in range(divisions + 1):
+        t = i / divisions
+        add_line((0.0, 0.0, t), (1.0, 0.0, t))
+        add_line((t, 0.0, 0.0), (t, 0.0, 1.0))
+
+    tick_size = 0.015 * SIMULATION_LENGTH
+    tick_frac = tick_size / SIMULATION_LENGTH
+    for i in range(1, divisions):
+        t = i / divisions
+        add_line((t, 0.0, 0.0), (t, 0.0, min(tick_frac, 0.05)))
+        add_line((0.0, 0.0, t), (min(tick_frac, 0.05), 0.0, t))
+
+    return np.array(vertices, dtype=np.float32)
+
+
+
+def build_axis_line(start_frac, end_frac):
+    return np.array([start_frac, end_frac], dtype=np.float32) * SIMULATION_LENGTH
+
+
+world_grid_vertices_np = build_world_grid_geometry(WORLD_GRID_DIVISIONS)
+if world_grid_vertices_np.size > 0:
+    world_grid_vertices = ti.Vector.field(3, float, world_grid_vertices_np.shape[0])
+    world_grid_vertices.from_numpy(world_grid_vertices_np)
+else:
+    world_grid_vertices = None
+
+axis_x_vertices_np = build_axis_line((0.0, 0.0, 0.0), (1.05, 0.0, 0.0))
+axis_y_vertices_np = build_axis_line((0.0, 0.0, 0.0), (0.0, 1.05, 0.0))
+axis_z_vertices_np = build_axis_line((0.0, 0.0, 0.0), (0.0, 0.0, 1.05))
+
+axis_x_vertices = ti.Vector.field(3, float, axis_x_vertices_np.shape[0])
+axis_x_vertices.from_numpy(axis_x_vertices_np)
+
+axis_y_vertices = ti.Vector.field(3, float, axis_y_vertices_np.shape[0])
+axis_y_vertices.from_numpy(axis_y_vertices_np)
+
+axis_z_vertices = ti.Vector.field(3, float, axis_z_vertices_np.shape[0])
+axis_z_vertices.from_numpy(axis_z_vertices_np)
+
+world_grid_tick_labels = [SIMULATION_LENGTH * i / max(WORLD_GRID_DIVISIONS, 1) for i in range(WORLD_GRID_DIVISIONS + 1)]
 
 F_x = ti.Vector.field(dim, float, n_particles)
 F_v = ti.Vector.field(dim, float, n_particles)
@@ -305,8 +397,7 @@ presets = [
     [
         CubeVolume(domain_vector([0.6, 0.05, 0.6]), domain_vector([0.25, 0.25, 0.25]), JELLY),
         #CubeVolume(domain_vector([0.35, 0.35, 0.35]), domain_vector([0.25, 0.25, 0.25]), SNOW),
-        CubeVolume(domain_vector([0.55, 0.8, 0.55]), domain_vector([0.15, 0.15, 0.15]), CONCRETE),
-        CubeVolume(domain_vector([0.75, 0.8, 0.75]), domain_vector([0.05, 0.15, 0.05]), CONCRETE),
+        CubeVolume(domain_vector([0.6, 0.8, 0.6]), domain_vector([0.15, 0.15, 0.15]), CONCRETE),
         CubeVolume(domain_vector([0.3, 0.8, 0.3]), domain_vector([0.15, 0.15, 0.15]), CONCRETE),
     ],
 ]
@@ -322,6 +413,7 @@ curr_preset_id = 0
 paused = False
 
 use_random_colors = False
+show_world_grid = False
 particles_radius = DEFAULT_PARTICLE_RADIUS
 
 material_colors = [
@@ -483,6 +575,7 @@ def show_options():
     global paused
     global particles_radius
     global curr_preset_id
+    global show_world_grid
 
     with gui.sub_window("Presets", 0.05, 0.1, 0.2, 0.15) as w:
         old_preset = curr_preset_id
@@ -518,6 +611,18 @@ def show_options():
             if w.button("Pause"):
                 paused = True
 
+    with gui.sub_window("World Grid", 0.78, 0.45, 0.17, 0.18) as w:
+        show_world_grid = w.checkbox("show world grid", show_world_grid)
+        w.text(f"domain: 0-{SIMULATION_LENGTH:.2f} m")
+        if show_world_grid:
+            tick_preview = [f"{value:.1f}" for value in world_grid_tick_labels]
+            w.text("ticks (m):")
+            if tick_preview:
+                midpoint = (len(tick_preview) + 1) // 2
+                w.text(", ".join(tick_preview[:midpoint]))
+                if midpoint < len(tick_preview):
+                    w.text(", ".join(tick_preview[midpoint:]))
+
 
 def render():
     camera_controller.update(window)
@@ -530,6 +635,13 @@ def render():
 
     scene.point_light(pos=tuple(domain_scalar(v) for v in (0.5, 1.5, 0.5)), color=(0.5, 0.5, 0.5))
     scene.point_light(pos=tuple(domain_scalar(v) for v in (0.5, 1.5, 1.5)), color=(0.5, 0.5, 0.5))
+
+    if show_world_grid:
+        if world_grid_vertices is not None and world_grid_vertices.shape[0] > 0:
+            scene.lines(world_grid_vertices, width=1.2, color=(0.6, 0.6, 0.6))
+        scene.lines(axis_x_vertices, width=2.0, color=(0.9, 0.3, 0.3))
+        scene.lines(axis_y_vertices, width=2.0, color=(0.3, 0.8, 0.3))
+        scene.lines(axis_z_vertices, width=2.0, color=(0.3, 0.4, 0.9))
 
     canvas.scene(scene)
 
