@@ -7,14 +7,36 @@ import taichi as ti
 
 ti.init(arch=ti.gpu)
 
+AXIS_LABEL_COLOR = (0.95, 0.95, 0.95)
+MAX_AXIS_TICK_LABELS = 6
+SIM_GRID_MAX_LINES = 64
+AXIS_LABEL_CHAR_HEIGHT_FACTOR = 0.045
+AXIS_LABEL_CHAR_ASPECT = 0.6
+AXIS_LABEL_CHAR_SPACING = 0.25
+AXIS_LABEL_SPACE_FACTOR = 0.65
+AXIS_LABEL_DEPTH_OFFSET_FACTOR = 0.0
+
+# Stability configuration
+CFL_NUMBER_BASE = 0.5
+CFL_NUMBER_EXPONENT = 0.3
+CFL_NUMBER_MAX = 0.9
+MAX_SUBSTEP_DT_BASE = 8.0e-4
+
 # Simulation configuration (SI units)
 DIM = 3
 REFERENCE_SIMULATION_LENGTH = 1.0  # metres, canonical domain edge length
-SIMULATION_LENGTH = 1.0  # metres, edge length of the cubic domain
+SIMULATION_LENGTH = 10.0  # metres, edge length of the cubic domain
 SIMULATION_SCALE = max(SIMULATION_LENGTH / REFERENCE_SIMULATION_LENGTH, 1e-6)
 MATERIAL_STIFFNESS_SCALE = max(SIMULATION_SCALE, 1.0)
 PLASTIC_STRETCH_SCALE = 1.0 / MATERIAL_STIFFNESS_SCALE
-GRID_RESOLUTION = 96  # cells along each edge at the reference scale
+STABILITY_SCALE = MATERIAL_STIFFNESS_SCALE
+CFL_NUMBER = min(CFL_NUMBER_BASE * (STABILITY_SCALE ** CFL_NUMBER_EXPONENT), CFL_NUMBER_MAX)
+MAX_SUBSTEP_DT = MAX_SUBSTEP_DT_BASE / math.sqrt(STABILITY_SCALE)
+GRID_RESOLUTION_BASE = 96  # cells along each edge at the reference scale
+AUTO_SCALE_GRID_RESOLUTION = True
+GRID_RESOLUTION_MAX = 128
+GRID_RESOLUTION_MIN = 48
+GRID_RESOLUTION_EXPONENT = 0.5
 SUBSTEPS_PER_FRAME = 20
 PACKING_FRACTION = 0.5  # fraction of cell size used for initial particle spacing
 BASE_DENSITY = 1000.0  # kg/m^3
@@ -22,9 +44,6 @@ BASE_YOUNG_MODULUS = 1.0e5  # Pa
 POISSON_RATIO = 0.2
 GRAVITY = [0.0, -9.81, 0.0]  # m/s^2
 BOUNDARY_CELLS = 3
-CFL_NUMBER = 0.5
-MAX_SUBSTEP_DT_BASE = 1.2e-4
-MAX_SUBSTEP_DT = MAX_SUBSTEP_DT_BASE / math.sqrt(MATERIAL_STIFFNESS_SCALE)
 
 BASE_WATER_STIFFNESS_MULTIPLIER = 1.5
 BASE_JELLY_HARDENING = 0.35
@@ -32,26 +51,34 @@ BASE_JELLY_STIFFNESS_MULTIPLIER = 0.85
 BASE_SNOW_STIFFNESS_MULTIPLIER = 2.2
 BASE_CONCRETE_HARDENING_MULTIPLIER = 12.0
 BASE_CONCRETE_STIFFNESS_MULTIPLIER = 4.0
-CONCRETE_PLASTIC_COMPRESSIVE = 5.0e-4
-CONCRETE_PLASTIC_TENSILE = 8.0e-4
+CONCRETE_RIGIDITY_GAIN = 6.5
+CONCRETE_RIGIDITY_SCALE = math.sqrt(CONCRETE_RIGIDITY_GAIN)
+CONCRETE_PLASTIC_COMPRESSIVE = 2.0e-4
+CONCRETE_PLASTIC_TENSILE = 5.2e-4
 
 WATER_STIFFNESS_MULTIPLIER = BASE_WATER_STIFFNESS_MULTIPLIER * MATERIAL_STIFFNESS_SCALE
 JELLY_HARDENING = BASE_JELLY_HARDENING * math.sqrt(MATERIAL_STIFFNESS_SCALE)
 JELLY_STIFFNESS_MULTIPLIER = BASE_JELLY_STIFFNESS_MULTIPLIER * MATERIAL_STIFFNESS_SCALE
 SNOW_STIFFNESS_MULTIPLIER = BASE_SNOW_STIFFNESS_MULTIPLIER * MATERIAL_STIFFNESS_SCALE
-CONCRETE_HARDENING_MULTIPLIER = BASE_CONCRETE_HARDENING_MULTIPLIER * MATERIAL_STIFFNESS_SCALE
-CONCRETE_STIFFNESS_MULTIPLIER = BASE_CONCRETE_STIFFNESS_MULTIPLIER * MATERIAL_STIFFNESS_SCALE
+CONCRETE_HARDENING_MULTIPLIER = BASE_CONCRETE_HARDENING_MULTIPLIER * MATERIAL_STIFFNESS_SCALE * CONCRETE_RIGIDITY_SCALE
+CONCRETE_STIFFNESS_MULTIPLIER = BASE_CONCRETE_STIFFNESS_MULTIPLIER * MATERIAL_STIFFNESS_SCALE * CONCRETE_RIGIDITY_SCALE
 CONCRETE_MIN_PLASTIC_STRETCH = 1.0 - CONCRETE_PLASTIC_COMPRESSIVE * PLASTIC_STRETCH_SCALE
 CONCRETE_MAX_PLASTIC_STRETCH = 1.0 + CONCRETE_PLASTIC_TENSILE * PLASTIC_STRETCH_SCALE
 
 WATER_DAMPING_PER_SECOND = 0.999
 JELLY_DAMPING_PER_SECOND = 0.92
 SNOW_DAMPING_PER_SECOND = 0.995
-CONCRETE_DAMPING_PER_SECOND = 0.985
+CONCRETE_DAMPING_PER_SECOND = 0.992
 
 DEFAULT_PARTICLE_RADIUS = 0.02 * SIMULATION_LENGTH
 MAX_PARTICLE_RADIUS = 0.1 * SIMULATION_LENGTH
 
+
+if AUTO_SCALE_GRID_RESOLUTION:
+    scaled_resolution = GRID_RESOLUTION_BASE * (SIMULATION_SCALE ** GRID_RESOLUTION_EXPONENT)
+    GRID_RESOLUTION = int(max(GRID_RESOLUTION_MIN, min(GRID_RESOLUTION_MAX, round(scaled_resolution))))
+else:
+    GRID_RESOLUTION = GRID_RESOLUTION_BASE
 
 dim = DIM
 n_grid = GRID_RESOLUTION
@@ -62,6 +89,7 @@ dx = SIMULATION_LENGTH / n_grid
 n_particles = n_grid**dim // 2 ** (dim - 1)
 print(f"Particles: {n_particles}")
 print(f"dx = {dx:.4e} m")
+print(f"CFL = {CFL_NUMBER:.2f}")
 
 p_vol = (dx * PACKING_FRACTION) ** dim
 p_rho = BASE_DENSITY
@@ -158,6 +186,41 @@ def build_axis_line(start_frac, end_frac):
     return np.array([start_frac, end_frac], dtype=np.float32) * SIMULATION_LENGTH
 
 
+
+def build_simulation_grid_vertices(resolution, max_lines):
+    if resolution <= 0 or max_lines <= 0:
+        return np.zeros((0, 3), dtype=np.float32)
+    step = max(1, int(math.ceil(resolution / max(max_lines, 1))))
+    coords = np.arange(0, resolution + 1, step, dtype=np.int32)
+    if coords[-1] != resolution:
+        coords = np.append(coords, resolution)
+    vertices = []
+    scale = SIMULATION_LENGTH / resolution
+
+    def add_line(p0, p1):
+        vertices.append(p0)
+        vertices.append(p1)
+
+    for y in coords:
+        for z in coords:
+            start = np.array([0.0, float(y), float(z)], dtype=np.float32) * scale
+            end = np.array([float(resolution), float(y), float(z)], dtype=np.float32) * scale
+            add_line(start, end)
+
+    for x in coords:
+        for z in coords:
+            start = np.array([float(x), 0.0, float(z)], dtype=np.float32) * scale
+            end = np.array([float(x), float(resolution), float(z)], dtype=np.float32) * scale
+            add_line(start, end)
+
+    for x in coords:
+        for y in coords:
+            start = np.array([float(x), float(y), 0.0], dtype=np.float32) * scale
+            end = np.array([float(x), float(y), float(resolution)], dtype=np.float32) * scale
+            add_line(start, end)
+
+    return np.array(vertices, dtype=np.float32)
+
 world_grid_vertices_np = build_world_grid_geometry(WORLD_GRID_DIVISIONS)
 if world_grid_vertices_np.size > 0:
     world_grid_vertices = ti.Vector.field(3, float, world_grid_vertices_np.shape[0])
@@ -177,8 +240,175 @@ axis_y_vertices.from_numpy(axis_y_vertices_np)
 
 axis_z_vertices = ti.Vector.field(3, float, axis_z_vertices_np.shape[0])
 axis_z_vertices.from_numpy(axis_z_vertices_np)
+simulation_grid_vertices_np = build_simulation_grid_vertices(n_grid, SIM_GRID_MAX_LINES)
+if simulation_grid_vertices_np.size > 0:
+    simulation_grid_vertices = ti.Vector.field(3, float, simulation_grid_vertices_np.shape[0])
+    simulation_grid_vertices.from_numpy(simulation_grid_vertices_np)
+    simulation_grid_line_count = simulation_grid_vertices_np.shape[0] // 2
+else:
+    simulation_grid_vertices = None
+    simulation_grid_line_count = 0
 
 world_grid_tick_labels = [SIMULATION_LENGTH * i / max(WORLD_GRID_DIVISIONS, 1) for i in range(WORLD_GRID_DIVISIONS + 1)]
+
+def select_tick_values(values, max_labels):
+    if max_labels <= 0 or len(values) <= max_labels:
+        return list(values)
+    step = max(1, int(math.ceil((len(values) - 1) / max(max_labels - 1, 1))))
+    selected = []
+    for idx in range(0, len(values), step):
+        selected.append(values[idx])
+    if selected[-1] != values[-1]:
+        selected.append(values[-1])
+    return selected
+
+axis_tick_values = select_tick_values(world_grid_tick_labels, MAX_AXIS_TICK_LABELS)
+axis_label_offset = 0.02 * SIMULATION_LENGTH
+axis_label_entries = []
+
+
+def add_axis_label(position, right, up, text):
+    axis_label_entries.append(
+        (
+            np.array(position, dtype=np.float32),
+            np.array(right, dtype=np.float32),
+            np.array(up, dtype=np.float32),
+            text,
+        )
+    )
+
+
+for idx, value in enumerate(axis_tick_values):
+    label_text = f"{value:.2f}"
+    add_axis_label((float(value), axis_label_offset, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0), label_text)
+    add_axis_label((-axis_label_offset, float(value), 0.0), (0.0, 0.0, 1.0), (0.0, 1.0, 0.0), label_text)
+    if idx > 0 or len(axis_tick_values) == 1:
+        add_axis_label((0.0, axis_label_offset, float(value)), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0), label_text)
+
+add_axis_label((SIMULATION_LENGTH * 1.04, axis_label_offset, 0.0), (0.0, 0.0, 1.0), (0.0, 1.0, 0.0), "X")
+add_axis_label((-axis_label_offset, SIMULATION_LENGTH * 1.04, 0.0), (0.0, 0.0, 1.0), (0.0, 1.0, 0.0), "Y")
+add_axis_label((0.0, axis_label_offset, SIMULATION_LENGTH * 1.04), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0), "Z")
+
+SEGMENT_LINES = {
+    "A": ((0.0, 1.0), (1.0, 1.0)),
+    "B": ((1.0, 1.0), (1.0, 0.5)),
+    "C": ((1.0, 0.5), (1.0, 0.0)),
+    "D": ((0.0, 0.0), (1.0, 0.0)),
+    "E": ((0.0, 0.5), (0.0, 0.0)),
+    "F": ((0.0, 1.0), (0.0, 0.5)),
+    "G": ((0.0, 0.5), (1.0, 0.5)),
+}
+
+DIGIT_SEGMENT_MAP = {
+    "0": ("A", "B", "C", "D", "E", "F"),
+    "1": ("B", "C"),
+    "2": ("A", "B", "G", "E", "D"),
+    "3": ("A", "B", "G", "C", "D"),
+    "4": ("F", "G", "B", "C"),
+    "5": ("A", "F", "G", "C", "D"),
+    "6": ("A", "F", "E", "D", "C", "G"),
+    "7": ("A", "B", "C"),
+    "8": ("A", "B", "C", "D", "E", "F", "G"),
+    "9": ("A", "B", "C", "D", "F", "G"),
+}
+
+STROKE_FONT = {digit: [SEGMENT_LINES[s] for s in segments] for digit, segments in DIGIT_SEGMENT_MAP.items()}
+STROKE_FONT["."] = [
+    ((0.75, 0.05), (0.9, 0.05)),
+    ((0.9, 0.05), (0.9, 0.0)),
+    ((0.9, 0.0), (0.75, 0.0)),
+    ((0.75, 0.0), (0.75, 0.05)),
+]
+STROKE_FONT["X"] = [((0.0, 0.0), (1.0, 1.0)), ((0.0, 1.0), (1.0, 0.0))]
+STROKE_FONT["Y"] = [((0.0, 1.0), (0.5, 0.5)), ((1.0, 1.0), (0.5, 0.5)), ((0.5, 0.5), (0.5, 0.0))]
+STROKE_FONT["Z"] = [((0.0, 1.0), (1.0, 1.0)), ((1.0, 1.0), (0.0, 0.0)), ((0.0, 0.0), (1.0, 0.0))]
+
+AXIS_LABEL_CHAR_HEIGHT = AXIS_LABEL_CHAR_HEIGHT_FACTOR * SIMULATION_LENGTH
+AXIS_LABEL_CHAR_WIDTH = AXIS_LABEL_CHAR_HEIGHT * AXIS_LABEL_CHAR_ASPECT
+AXIS_LABEL_GLYPH_SPACING = AXIS_LABEL_CHAR_WIDTH * AXIS_LABEL_CHAR_SPACING
+AXIS_LABEL_SPACE_ADVANCE = AXIS_LABEL_CHAR_WIDTH * AXIS_LABEL_SPACE_FACTOR
+AXIS_LABEL_DEPTH_OFFSET = AXIS_LABEL_DEPTH_OFFSET_FACTOR * SIMULATION_LENGTH
+
+
+def build_axis_label_geometry(entries):
+    if AXIS_LABEL_CHAR_HEIGHT <= 0 or not entries:
+        return np.zeros((0, 3), dtype=np.float32)
+
+    vertices = []
+    char_height = AXIS_LABEL_CHAR_HEIGHT
+    char_width = AXIS_LABEL_CHAR_WIDTH
+    glyph_spacing = AXIS_LABEL_GLYPH_SPACING
+    space_advance = AXIS_LABEL_SPACE_ADVANCE
+    depth_bias = AXIS_LABEL_DEPTH_OFFSET
+
+    for position, right_vec, up_vec, raw_text in entries:
+        text = raw_text.upper()
+        right_norm = np.linalg.norm(right_vec)
+        up_norm = np.linalg.norm(up_vec)
+        if right_norm < 1e-6 or up_norm < 1e-6:
+            continue
+        right_dir = right_vec / right_norm
+        up_dir = up_vec / up_norm
+        normal = np.cross(right_dir, up_dir)
+        normal_norm = np.linalg.norm(normal)
+        if normal_norm < 1e-6:
+            depth_offset = np.zeros(3, dtype=np.float32)
+        else:
+            depth_offset = normal / normal_norm * depth_bias
+
+        text_width = 0.0
+        first = True
+        for ch in text:
+            if ch == " ":
+                text_width += space_advance
+                continue
+            if ch not in STROKE_FONT:
+                text_width += space_advance
+                continue
+            if not first:
+                text_width += glyph_spacing
+            text_width += char_width
+            first = False
+
+        if text_width <= 1e-6:
+            continue
+
+        origin = position.astype(np.float32) + depth_offset - right_dir * (text_width * 0.5) - up_dir * (char_height * 0.5)
+        cursor = 0.0
+        first = True
+
+        for ch in text:
+            if ch == " ":
+                cursor += space_advance
+                continue
+            glyph = STROKE_FONT.get(ch)
+            if glyph is None:
+                cursor += space_advance
+                continue
+            if not first:
+                cursor += glyph_spacing
+            for (sx, sy), (ex, ey) in glyph:
+                start = origin + right_dir * (cursor + sx * char_width) + up_dir * (sy * char_height)
+                end = origin + right_dir * (cursor + ex * char_width) + up_dir * (ey * char_height)
+                vertices.append(start.astype(np.float32))
+                vertices.append(end.astype(np.float32))
+            cursor += char_width
+            first = False
+
+    if not vertices:
+        return np.zeros((0, 3), dtype=np.float32)
+
+    return np.stack(vertices, axis=0)
+
+
+axis_label_vertices_np = build_axis_label_geometry(axis_label_entries)
+if axis_label_vertices_np.size > 0:
+    axis_label_vertices = ti.Vector.field(3, float, axis_label_vertices_np.shape[0])
+    axis_label_vertices.from_numpy(axis_label_vertices_np)
+    axis_label_line_count = axis_label_vertices_np.shape[0] // 2
+else:
+    axis_label_vertices = None
+    axis_label_line_count = 0
 
 F_x = ti.Vector.field(dim, float, n_particles)
 F_v = ti.Vector.field(dim, float, n_particles)
@@ -414,6 +644,7 @@ paused = False
 
 use_random_colors = False
 show_world_grid = False
+show_simulation_grid = False
 particles_radius = DEFAULT_PARTICLE_RADIUS
 
 material_colors = [
@@ -576,6 +807,7 @@ def show_options():
     global particles_radius
     global curr_preset_id
     global show_world_grid
+    global show_simulation_grid
 
     with gui.sub_window("Presets", 0.05, 0.1, 0.2, 0.15) as w:
         old_preset = curr_preset_id
@@ -611,17 +843,24 @@ def show_options():
             if w.button("Pause"):
                 paused = True
 
-    with gui.sub_window("World Grid", 0.78, 0.45, 0.17, 0.18) as w:
+    with gui.sub_window("World Grid", 0.78, 0.45, 0.17, 0.22) as w:
         show_world_grid = w.checkbox("show world grid", show_world_grid)
+        show_simulation_grid = w.checkbox("show simulation grid", show_simulation_grid)
         w.text(f"domain: 0-{SIMULATION_LENGTH:.2f} m")
+        w.text(f"grid: {n_grid}^3 cells")
+        w.text(f"dx: {dx:.4e} m")
         if show_world_grid:
             tick_preview = [f"{value:.1f}" for value in world_grid_tick_labels]
-            w.text("ticks (m):")
             if tick_preview:
                 midpoint = (len(tick_preview) + 1) // 2
+                w.text("ticks (m):")
                 w.text(", ".join(tick_preview[:midpoint]))
                 if midpoint < len(tick_preview):
                     w.text(", ".join(tick_preview[midpoint:]))
+        if show_simulation_grid and simulation_grid_line_count:
+            w.text(f"sim lines: {simulation_grid_line_count}")
+        if (show_world_grid or show_simulation_grid) and axis_label_line_count:
+            w.text(f"label strokes: {axis_label_line_count}")
 
 
 def render():
@@ -642,6 +881,12 @@ def render():
         scene.lines(axis_x_vertices, width=2.0, color=(0.9, 0.3, 0.3))
         scene.lines(axis_y_vertices, width=2.0, color=(0.3, 0.8, 0.3))
         scene.lines(axis_z_vertices, width=2.0, color=(0.3, 0.4, 0.9))
+
+    if show_simulation_grid and simulation_grid_vertices is not None and simulation_grid_vertices.shape[0] > 0:
+        scene.lines(simulation_grid_vertices, width=0.8, color=(0.35, 0.45, 0.75))
+
+    if (show_world_grid or show_simulation_grid) and axis_label_vertices is not None and axis_label_vertices.shape[0] > 0:
+        scene.lines(axis_label_vertices, width=1.1, color=AXIS_LABEL_COLOR)
 
     canvas.scene(scene)
 
