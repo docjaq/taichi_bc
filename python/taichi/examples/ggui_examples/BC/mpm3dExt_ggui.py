@@ -10,11 +10,14 @@ ti.init(arch=ti.gpu)
 AXIS_LABEL_COLOR = (0.95, 0.95, 0.95)
 MAX_AXIS_TICK_LABELS = 6
 SIM_GRID_MAX_LINES = 64
-AXIS_LABEL_CHAR_HEIGHT_FACTOR = 0.045
+AXIS_LABEL_CHAR_HEIGHT_FACTOR = 0.0225
 AXIS_LABEL_CHAR_ASPECT = 0.6
 AXIS_LABEL_CHAR_SPACING = 0.25
 AXIS_LABEL_SPACE_FACTOR = 0.65
-AXIS_LABEL_DEPTH_OFFSET_FACTOR = 0.0
+AXIS_LABEL_DEPTH_OFFSET_FACTOR = 0.006
+AXIS_LABEL_OFFSET_FACTOR = 0.035
+AXIS_LABEL_X_PADDING = 1.35
+AXIS_LABEL_Z_PADDING = 1.2
 
 # Stability configuration
 CFL_NUMBER_BASE = 0.5
@@ -25,7 +28,7 @@ MAX_SUBSTEP_DT_BASE = 8.0e-4
 # Simulation configuration (SI units)
 DIM = 3
 REFERENCE_SIMULATION_LENGTH = 1.0  # metres, canonical domain edge length
-SIMULATION_LENGTH = 10.0  # metres, edge length of the cubic domain
+SIMULATION_LENGTH = 1.0  # metres, edge length of the cubic domain
 SIMULATION_SCALE = max(SIMULATION_LENGTH / REFERENCE_SIMULATION_LENGTH, 1e-6)
 MATERIAL_STIFFNESS_SCALE = max(SIMULATION_SCALE, 1.0)
 PLASTIC_STRETCH_SCALE = 1.0 / MATERIAL_STIFFNESS_SCALE
@@ -263,7 +266,7 @@ def select_tick_values(values, max_labels):
     return selected
 
 axis_tick_values = select_tick_values(world_grid_tick_labels, MAX_AXIS_TICK_LABELS)
-axis_label_offset = 0.02 * SIMULATION_LENGTH
+axis_label_offset = AXIS_LABEL_OFFSET_FACTOR * SIMULATION_LENGTH
 axis_label_entries = []
 
 
@@ -278,16 +281,20 @@ def add_axis_label(position, right, up, text):
     )
 
 
+x_face_offset = axis_label_offset * AXIS_LABEL_X_PADDING
+z_face_offset = axis_label_offset * AXIS_LABEL_Z_PADDING
+
 for idx, value in enumerate(axis_tick_values):
     label_text = f"{value:.2f}"
-    add_axis_label((float(value), axis_label_offset, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0), label_text)
+    if idx > 0:  # skip duplicate 0 on X axis
+        add_axis_label((float(value), axis_label_offset, -x_face_offset), (0.0, 0.0, 1.0), (0.0, 1.0, 0.0), label_text)
     add_axis_label((-axis_label_offset, float(value), 0.0), (0.0, 0.0, 1.0), (0.0, 1.0, 0.0), label_text)
     if idx > 0 or len(axis_tick_values) == 1:
-        add_axis_label((0.0, axis_label_offset, float(value)), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0), label_text)
+        add_axis_label((-z_face_offset, axis_label_offset, float(value)), (-1.0, 0.0, 0.0), (0.0, 1.0, 0.0), label_text)
 
-add_axis_label((SIMULATION_LENGTH * 1.04, axis_label_offset, 0.0), (0.0, 0.0, 1.0), (0.0, 1.0, 0.0), "X")
+add_axis_label((SIMULATION_LENGTH * 1.04, axis_label_offset, -x_face_offset), (0.0, 0.0, 1.0), (0.0, 1.0, 0.0), "X")
 add_axis_label((-axis_label_offset, SIMULATION_LENGTH * 1.04, 0.0), (0.0, 0.0, 1.0), (0.0, 1.0, 0.0), "Y")
-add_axis_label((0.0, axis_label_offset, SIMULATION_LENGTH * 1.04), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0), "Z")
+add_axis_label((-z_face_offset, axis_label_offset, SIMULATION_LENGTH * 1.04), (-1.0, 0.0, 0.0), (0.0, 1.0, 0.0), "Z")
 
 SEGMENT_LINES = {
     "A": ((0.0, 1.0), (1.0, 1.0)),
