@@ -88,6 +88,9 @@ n_grid = GRID_RESOLUTION
 
 
 dx = SIMULATION_LENGTH / n_grid
+BOUNDARY_MARGIN = dx * (BOUNDARY_CELLS + 0.5)
+RELATIVE_BOUNDARY_MARGIN = BOUNDARY_MARGIN / SIMULATION_LENGTH
+SIDE_MARGIN_REL = max(0.02, RELATIVE_BOUNDARY_MARGIN)
 
 n_particles = n_grid**dim // 2 ** (dim - 1)
 print(f"Particles: {n_particles}")
@@ -637,12 +640,25 @@ presets = [
         CubeVolume(domain_vector([0.6, 0.8, 0.6]), domain_vector([0.15, 0.15, 0.15]), CONCRETE),
         CubeVolume(domain_vector([0.3, 0.8, 0.3]), domain_vector([0.15, 0.15, 0.15]), CONCRETE),
     ],
+    [
+        CubeVolume(
+            domain_vector([SIDE_MARGIN_REL, RELATIVE_BOUNDARY_MARGIN, SIDE_MARGIN_REL]),
+            domain_vector([1.0 - 2.0 * SIDE_MARGIN_REL, 0.15, 1.0 - 2.0 * SIDE_MARGIN_REL]),
+            SNOW,
+        ),
+        CubeVolume(
+            domain_vector([0.4, RELATIVE_BOUNDARY_MARGIN + 0.55, 0.4]),
+            domain_vector([0.2, 0.2, 0.2]),
+            CONCRETE,
+        ),
+    ],
 ]
 preset_names = [
     "Single Dam Break",
     "Double Dam Break",
     "Water Snow Jelly",
     "Jelly Snow Concrete",
+    "Snow Cushion Drop",
 ]
 
 curr_preset_id = 0
