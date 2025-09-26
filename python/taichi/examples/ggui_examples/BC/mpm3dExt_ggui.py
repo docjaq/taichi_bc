@@ -140,6 +140,19 @@ def domain_vector(values):
     return ti.Vector(values) * SIMULATION_LENGTH
 
 
+def euler_to_rotation_matrix(angles):
+    if angles is None:
+        return np.identity(3, dtype=np.float32)
+    ax, ay, az = angles
+    cx, sx = math.cos(ax), math.sin(ax)
+    cy, sy = math.cos(ay), math.sin(ay)
+    cz, sz = math.cos(az), math.sin(az)
+    rx = np.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]], dtype=np.float32)
+    ry = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]], dtype=np.float32)
+    rz = np.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]], dtype=np.float32)
+    return (rz @ ry @ rx).astype(np.float32)
+
+
 WORLD_GRID_DIVISIONS = 10
 
 
@@ -545,11 +558,13 @@ def substep(g_x: float, g_y: float, g_z: float):
 
 
 class CubeVolume:
-    def __init__(self, minimum, size, material):
+    def __init__(self, minimum, size, material, rotation=None, initial_velocity=None):
         self.minimum = minimum
         self.size = size
         self.volume = self.size.x * self.size.y * self.size.z
         self.material = material
+        self.rotation = tuple(rotation) if rotation is not None else (0.0, 0.0, 0.0)
+        self.initial_velocity = tuple(initial_velocity) if initial_velocity is not None else (0.0, 0.0, 0.0)
 
 
 @ti.kernel
@@ -563,14 +578,28 @@ def init_cube_vol(
     y_size: float,
     z_size: float,
     material: int,
+    r00: float,
+    r01: float,
+    r02: float,
+    r10: float,
+    r11: float,
+    r12: float,
+    r20: float,
+    r21: float,
+    r22: float,
+    vel_x: float,
+    vel_y: float,
+    vel_z: float,
 ):
+    rotation = ti.Matrix([[r00, r01, r02], [r10, r11, r12], [r20, r21, r22]])
+    center = ti.Vector([x_begin + 0.5 * x_size, y_begin + 0.5 * y_size, z_begin + 0.5 * z_size])
     for i in range(first_par, last_par):
-        F_x[i] = ti.Vector([ti.random() for i in range(dim)]) * ti.Vector([x_size, y_size, z_size]) + ti.Vector(
-            [x_begin, y_begin, z_begin]
-        )
+        local = (ti.Vector([ti.random() for _ in range(dim)]) - 0.5) * ti.Vector([x_size, y_size, z_size])
+        rotated = rotation @ local
+        F_x[i] = rotated + center
         F_Jp[i] = 1
         F_dg[i] = ti.Matrix([[1, 0, 0], [0, 1, 0], [0, 0, 1]])
-        F_v[i] = ti.Vector([0.0, 0.0, 0.0])
+        F_v[i] = ti.Vector([vel_x, vel_y, vel_z])
         F_materials[i] = material
         F_colors_random[i] = ti.Vector([ti.random(), ti.random(), ti.random(), ti.random()])
         F_used[i] = 1
@@ -601,7 +630,30 @@ def init_vols(vols):
             par_count = int(v.volume / total_vol * n_particles)
             if i == len(vols) - 1:  # this is the last volume, so use all remaining particles
                 par_count = n_particles - next_p
-            init_cube_vol(next_p, next_p + par_count, *v.minimum, *v.size, v.material)
+            rot_mat = euler_to_rotation_matrix(v.rotation)
+            init_cube_vol(
+                next_p,
+                next_p + par_count,
+                float(v.minimum[0]),
+                float(v.minimum[1]),
+                float(v.minimum[2]),
+                float(v.size[0]),
+                float(v.size[1]),
+                float(v.size[2]),
+                v.material,
+                float(rot_mat[0, 0]),
+                float(rot_mat[0, 1]),
+                float(rot_mat[0, 2]),
+                float(rot_mat[1, 0]),
+                float(rot_mat[1, 1]),
+                float(rot_mat[1, 2]),
+                float(rot_mat[2, 0]),
+                float(rot_mat[2, 1]),
+                float(rot_mat[2, 2]),
+                float(v.initial_velocity[0]),
+                float(v.initial_velocity[1]),
+                float(v.initial_velocity[2]),
+            )
             next_p += par_count
         else:
             raise Exception("???")
@@ -647,9 +699,11 @@ presets = [
             SNOW,
         ),
         CubeVolume(
-            domain_vector([0.4, RELATIVE_BOUNDARY_MARGIN + 0.55, 0.4]),
+            domain_vector([SIDE_MARGIN_REL + 0.08, RELATIVE_BOUNDARY_MARGIN + 0.55, SIDE_MARGIN_REL + 0.08]),
             domain_vector([0.2, 0.2, 0.2]),
             CONCRETE,
+            rotation=(0.0, math.radians(20.0), 0.0),
+            initial_velocity=(1.0, -5.0, 1.0),
         ),
     ],
 ]
