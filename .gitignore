@@ -83,6 +83,7 @@ _build
 *.json
 !tests/**/*.json
 !docs/**/*.json
+!python/taichi/examples/ggui_examples/BC/scenes/*.json
 imgui.ini
 /venv/
 /_skbuild/

@@ -1,11 +1,26 @@
 import math
+import sys
 import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
 import taichi as ti
 
 ti.init(arch=ti.gpu)
+
+CURRENT_DIR = Path(__file__).resolve().parent
+if str(CURRENT_DIR) not in sys.path:
+    sys.path.insert(0, str(CURRENT_DIR))
+
+try:
+    from scene_loader import SceneDefinition, load_scenes
+except Exception as exc:
+    load_scenes = None
+    SceneDefinition = None
+    print(f"[mpm3dExt] Warning: unable to import scene_loader: {exc}")
 
 AXIS_LABEL_COLOR = (0.95, 0.95, 0.95)
 MAX_AXIS_TICK_LABELS = 6
@@ -45,7 +60,8 @@ PACKING_FRACTION = 0.5  # fraction of cell size used for initial particle spacin
 BASE_DENSITY = 1000.0  # kg/m^3
 BASE_YOUNG_MODULUS = 1.0e5  # Pa
 POISSON_RATIO = 0.2
-GRAVITY = [0.0, -9.81, 0.0]  # m/s^2
+DEFAULT_GRAVITY = [0.0, -9.81, 0.0]  # m/s^2
+GRAVITY = list(DEFAULT_GRAVITY)
 BOUNDARY_CELLS = 3
 
 BASE_WATER_STIFFNESS_MULTIPLIER = 1.5
@@ -454,6 +470,123 @@ SNOW = 2
 CONCRETE = 3
 
 
+MATERIAL_NAME_MAP: Dict[str, int] = {
+    "WATER": WATER,
+    "JELLY": JELLY,
+    "SNOW": SNOW,
+    "CONCRETE": CONCRETE,
+}
+
+
+def _resolve_material(material_name: str, warning_sink: List[str]) -> int:
+    key = material_name.upper()
+    if key not in MATERIAL_NAME_MAP:
+        warning_sink.append(f"unknown material '{material_name}', defaulting to WATER")
+    return MATERIAL_NAME_MAP.get(key, WATER)
+
+
+def _sanitize_override_vec3(value: object, name: str, warning_sink: List[str]) -> Optional[Tuple[float, float, float]]:
+    if value is None:
+        return None
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)) or len(value) != 3:
+        warning_sink.append(f"override '{name}' must be a sequence of 3 numbers; ignored")
+        return None
+    try:
+        vec = tuple(float(v) for v in value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        warning_sink.append(f"override '{name}' has non-numeric entries; ignored")
+        return None
+    return vec  # type: ignore[return-value]
+
+
+def _scene_object_summary(scene_object) -> str:
+    material = getattr(scene_object, "material", "?")
+    ident = getattr(scene_object, "scene_id", getattr(scene_object, "id", "object"))
+    return f"{ident} [{material}]"
+
+
+def _build_scene_entry_from_definition(definition) -> Optional["SceneEntry"]:
+    warnings = list(getattr(definition, "warnings", []))
+    volumes: List[CubeVolume] = []
+    summaries: List[str] = []
+
+    for obj in getattr(definition, "objects", []):
+        material_id = _resolve_material(getattr(obj, "material", "WATER"), warnings)
+        try:
+            minimum = domain_vector(getattr(obj, "position"))
+            size = domain_vector(getattr(obj, "size"))
+        except Exception:
+            warnings.append(f"object '{getattr(obj, 'scene_id', '?')}' has invalid position/size; skipped")
+            continue
+        rotation = getattr(obj, "rotation_euler", (0.0, 0.0, 0.0))
+        velocity = getattr(obj, "initial_velocity", (0.0, 0.0, 0.0))
+        volumes.append(
+            CubeVolume(
+                minimum=minimum,
+                size=size,
+                material=material_id,
+                rotation=rotation,
+                initial_velocity=velocity,
+            )
+        )
+        summaries.append(_scene_object_summary(obj))
+
+    overrides: Dict[str, object] = {}
+    override_payload = getattr(definition, "simulation_overrides", {})
+    if isinstance(override_payload, dict):
+        gravity_override = _sanitize_override_vec3(override_payload.get("gravity"), "gravity", warnings)
+        if gravity_override is not None:
+            overrides["gravity"] = gravity_override
+        timeline_duration = override_payload.get("timeline_duration")
+        if timeline_duration is not None:
+            try:
+                overrides["timeline_duration"] = float(timeline_duration)
+            except (TypeError, ValueError):
+                warnings.append("override 'timeline_duration' must be numeric; ignored")
+
+    source = ""
+    path_obj = getattr(definition, "path", None)
+    if path_obj is not None:
+        try:
+            source = str(Path(path_obj).resolve().relative_to(CURRENT_DIR))
+        except Exception:
+            source = str(path_obj)
+
+    title = getattr(definition, "title", getattr(definition, "key", "Scene"))
+    description = getattr(definition, "description", "")
+
+    if not volumes:
+        warnings.append("scene contains no usable objects")
+        return None
+
+    return SceneEntry(
+        title=title,
+        description=description,
+        volumes=volumes,
+        overrides=overrides,
+        warnings=warnings,
+        source=source or "(inline)",
+        object_summaries=summaries,
+    )
+
+
+def _build_legacy_scene_entries() -> List["SceneEntry"]:
+    entries: List["SceneEntry"] = []
+    for name, volumes in zip(legacy_preset_names, legacy_presets):
+        entries.append(
+            SceneEntry(
+                title=f"Legacy - {name}",
+                description="Built-in preset previously hard-coded in the demo.",
+                volumes=volumes,
+                overrides={},
+                warnings=[],
+                source="legacy",
+                object_summaries=[f"preset with {len(volumes)} volume(s)"],
+            )
+        )
+    return entries
+
+
 @ti.kernel
 def substep(g_x: float, g_y: float, g_z: float):
     for I in ti.grouped(F_grid_m):
@@ -567,6 +700,17 @@ class CubeVolume:
         self.initial_velocity = tuple(initial_velocity) if initial_velocity is not None else (0.0, 0.0, 0.0)
 
 
+@dataclass
+class SceneEntry:
+    title: str
+    description: str
+    volumes: List["CubeVolume"]
+    overrides: Dict[str, object]
+    warnings: List[str]
+    source: str
+    object_summaries: List[str]
+
+
 @ti.kernel
 def init_cube_vol(
     first_par: int,
@@ -671,9 +815,9 @@ def set_color_by_material(mat_color: ti.types.ndarray()):
             F_colors[i] = ti.Vector([1.0, 1.0, 1.0, 1.0])
 
 
-print("Loading presets...this might take a minute")
+print("Loading scenes...this might take a minute")
 
-presets = [
+legacy_presets = [
     [
         CubeVolume(domain_vector([0.55, 0.05, 0.55]), domain_vector([0.4, 0.4, 0.4]), WATER),
     ],
@@ -707,7 +851,7 @@ presets = [
         ),
     ],
 ]
-preset_names = [
+legacy_preset_names = [
     "Single Dam Break",
     "Double Dam Break",
     "Water Snow Jelly",
@@ -715,7 +859,31 @@ preset_names = [
     "Snow Cushion Drop",
 ]
 
-curr_preset_id = 0
+scene_dir = CURRENT_DIR / "scenes"
+scene_entries: List["SceneEntry"] = []
+scene_loader_messages: List[str] = []
+
+if load_scenes is not None:
+    for definition in load_scenes(scene_dir):
+        entry = _build_scene_entry_from_definition(definition)
+        if entry is None:
+            label = getattr(definition, "title", getattr(definition, "key", str(definition)))
+            scene_loader_messages.append(f"Scene '{label}' skipped: no usable objects.")
+            continue
+        scene_entries.append(entry)
+        for warning in entry.warnings:
+            scene_loader_messages.append(f"[{entry.title}] {warning}")
+else:
+    scene_loader_messages.append("Scene loader unavailable; using built-in presets only.")
+
+if not scene_entries:
+    scene_loader_messages.append("No JSON scenes loaded; falling back to legacy presets.")
+    scene_entries = _build_legacy_scene_entries()
+else:
+    scene_entries.extend(_build_legacy_scene_entries())
+
+scene_names = [entry.title for entry in scene_entries]
+curr_scene_id = 0
 
 paused = False
 
@@ -725,7 +893,8 @@ show_simulation_grid = False
 particles_radius = DEFAULT_PARTICLE_RADIUS
 
 # Simulation timeline state
-timeline_duration = 10.0
+DEFAULT_TIMELINE_DURATION = 10.0
+timeline_duration = DEFAULT_TIMELINE_DURATION
 simulation_time = 0.0
 sim_frame_count = 0
 sim_substep_count = 0
@@ -746,15 +915,44 @@ def reset_timeline():
     sim_substep_count = 0
 
 
+def apply_scene_overrides(scene_entry: SceneEntry):
+    global timeline_duration
+    timeline_duration = DEFAULT_TIMELINE_DURATION
+    GRAVITY[:] = DEFAULT_GRAVITY
+    overrides = scene_entry.overrides
+    gravity_override = overrides.get("gravity") if isinstance(overrides, dict) else None
+    if gravity_override is not None:
+        for i in range(3):
+            GRAVITY[i] = float(gravity_override[i])
+    timeline_override = overrides.get("timeline_duration") if isinstance(overrides, dict) else None
+    if timeline_override is not None:
+        try:
+            timeline_duration = float(timeline_override)
+        except (TypeError, ValueError):
+            pass
+
+
 def init():
     global paused
     reset_timeline()
-    init_vols(presets[curr_preset_id])
+    current_scene = scene_entries[curr_scene_id]
+    init_vols(current_scene.volumes)
     if not use_random_colors:
         set_color_by_material(np.array(material_colors, dtype=np.float32))
 
 
-init()
+def load_scene(index: int):
+    global curr_scene_id
+    if not scene_entries:
+        return
+    index = max(0, min(index, len(scene_entries) - 1))
+    curr_scene_id = index
+    apply_scene_overrides(scene_entries[curr_scene_id])
+    init()
+
+
+load_scene(curr_scene_id)
+
 
 res = (1080, 720)
 window = ti.ui.Window("Real MPM 3D", res, vsync=True)
@@ -897,7 +1095,7 @@ def show_options():
     global use_random_colors
     global paused
     global particles_radius
-    global curr_preset_id
+    global curr_scene_id
     global show_world_grid
     global show_simulation_grid
     global timeline_duration
@@ -906,21 +1104,62 @@ def show_options():
     global sim_frame_count
     global sim_substep_count
 
-    with gui.sub_window("Presets", 0.05, 0.1, 0.2, 0.15) as w:
-        old_preset = curr_preset_id
-        for i in range(len(presets)):
-            if w.checkbox(preset_names[i], curr_preset_id == i):
-                curr_preset_id = i
-        if curr_preset_id != old_preset:
-            init()
-            paused = True
+    with gui.sub_window("Scenes", 0.05, 0.1, 0.26, 0.24) as w:
+        if not scene_entries:
+            w.text("No scenes available")
+        else:
+            old_scene = curr_scene_id
+            for i, name in enumerate(scene_names):
+                if w.checkbox(name, curr_scene_id == i):
+                    curr_scene_id = i
+            if curr_scene_id != old_scene:
+                load_scene(curr_scene_id)
+                paused = True
 
-    with gui.sub_window("Gravity", 0.05, 0.3, 0.2, 0.1) as w:
+            active_scene = scene_entries[curr_scene_id]
+            w.text(f"source: {active_scene.source}")
+            if active_scene.description:
+                for line in active_scene.description.splitlines():
+                    w.text(line[:64])
+            w.text(f"objects: {len(active_scene.volumes)}")
+            max_listed = 3
+            for summary in active_scene.object_summaries[:max_listed]:
+                w.text(f"- {summary}")
+            remaining = len(active_scene.object_summaries) - max_listed
+            if remaining > 0:
+                w.text(f"- (+{remaining} more)")
+            overrides = active_scene.overrides if isinstance(active_scene.overrides, dict) else {}
+            gravity_override = overrides.get("gravity")
+            if gravity_override is not None:
+                w.text(
+                    "gravity: "
+                    f"({gravity_override[0]:.2f}, {gravity_override[1]:.2f}, {gravity_override[2]:.2f})"
+                )
+            if overrides.get("timeline_duration") is not None:
+                w.text(f"timeline default: {overrides['timeline_duration']:.2f} s")
+            if active_scene.warnings:
+                w.text("Scene warnings:")
+                lim = 2
+                for warning in active_scene.warnings[:lim]:
+                    w.text(warning[:64])
+                extra_warnings = len(active_scene.warnings) - lim
+                if extra_warnings > 0:
+                    w.text(f"... (+{extra_warnings})")
+        if scene_loader_messages:
+            w.text("Messages:")
+            max_msgs = 3
+            for msg in scene_loader_messages[:max_msgs]:
+                w.text(msg[:64])
+            extra = len(scene_loader_messages) - max_msgs
+            if extra > 0:
+                w.text(f"... (+{extra})")
+
+    with gui.sub_window("Gravity", 0.05, 0.36, 0.26, 0.12) as w:
         GRAVITY[0] = w.slider_float("x", GRAVITY[0], -10, 10)
         GRAVITY[1] = w.slider_float("y", GRAVITY[1], -10, 10)
         GRAVITY[2] = w.slider_float("z", GRAVITY[2], -10, 10)
 
-    with gui.sub_window("Timeline", 0.32, 0.1, 0.34, 0.24) as w:
+    with gui.sub_window("Timeline", 0.34, 0.1, 0.34, 0.24) as w:
         status_text = "paused" if paused else "running"
         w.text(f"status: {status_text}")
         w.text(f"time: {simulation_time:.3f} s")
@@ -947,7 +1186,7 @@ def show_options():
         if w.button("reset timeline"):
             reset_timeline()
 
-    with gui.sub_window("Options", 0.05, 0.45, 0.2, 0.4) as w:
+    with gui.sub_window("Options", 0.05, 0.5, 0.26, 0.35) as w:
         use_random_colors = w.checkbox("use_random_colors", use_random_colors)
         if not use_random_colors:
             material_colors[WATER] = w.color_edit_3("water color", material_colors[WATER])
@@ -967,7 +1206,7 @@ def show_options():
             if w.button("Pause"):
                 paused = True
 
-    with gui.sub_window("World Grid", 0.78, 0.45, 0.17, 0.22) as w:
+    with gui.sub_window("World Grid", 0.75, 0.45, 0.2, 0.22) as w:
         show_world_grid = w.checkbox("show world grid", show_world_grid)
         show_simulation_grid = w.checkbox("show simulation grid", show_simulation_grid)
         w.text(f"domain: 0-{SIMULATION_LENGTH:.2f} m")

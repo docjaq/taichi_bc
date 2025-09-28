@@ -1,0 +1,20 @@
+{
+  "meta": {
+    "title": "Single Water Block",
+    "description": "One water volume suspended above the floor for quick smoke tests.",
+    "tags": ["demo", "water"]
+  },
+  "simulation": {
+    "gravity": [0.0, -9.81, 0.0],
+    "timeline_duration": 10.0
+  },
+  "objects": [
+    {
+      "id": "water_block",
+      "type": "cube_volume",
+      "material": "WATER",
+      "position": [0.55, 0.05, 0.55],
+      "size": [0.4, 0.4, 0.4]
+    }
+  ]
+}
