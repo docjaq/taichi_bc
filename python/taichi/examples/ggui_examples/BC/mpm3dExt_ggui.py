@@ -724,6 +724,13 @@ show_world_grid = False
 show_simulation_grid = False
 particles_radius = DEFAULT_PARTICLE_RADIUS
 
+# Simulation timeline state
+timeline_duration = 10.0
+simulation_time = 0.0
+sim_frame_count = 0
+sim_substep_count = 0
+timeline_auto_pause = False
+
 material_colors = [
     (0.1, 0.6, 0.9),
     (0.93, 0.33, 0.23),
@@ -732,8 +739,16 @@ material_colors = [
 ]
 
 
+def reset_timeline():
+    global simulation_time, sim_frame_count, sim_substep_count
+    simulation_time = 0.0
+    sim_frame_count = 0
+    sim_substep_count = 0
+
+
 def init():
     global paused
+    reset_timeline()
     init_vols(presets[curr_preset_id])
     if not use_random_colors:
         set_color_by_material(np.array(material_colors, dtype=np.float32))
@@ -885,6 +900,11 @@ def show_options():
     global curr_preset_id
     global show_world_grid
     global show_simulation_grid
+    global timeline_duration
+    global timeline_auto_pause
+    global simulation_time
+    global sim_frame_count
+    global sim_substep_count
 
     with gui.sub_window("Presets", 0.05, 0.1, 0.2, 0.15) as w:
         old_preset = curr_preset_id
@@ -899,6 +919,33 @@ def show_options():
         GRAVITY[0] = w.slider_float("x", GRAVITY[0], -10, 10)
         GRAVITY[1] = w.slider_float("y", GRAVITY[1], -10, 10)
         GRAVITY[2] = w.slider_float("z", GRAVITY[2], -10, 10)
+
+    with gui.sub_window("Timeline", 0.32, 0.1, 0.34, 0.24) as w:
+        status_text = "paused" if paused else "running"
+        w.text(f"status: {status_text}")
+        w.text(f"time: {simulation_time:.3f} s")
+        timeline_duration = w.slider_float("duration (s)", timeline_duration, 0.0, 120.0)
+        if timeline_duration > 0.0:
+            progress_fraction = min(simulation_time / timeline_duration, 1.0)
+            remaining = max(timeline_duration - simulation_time, 0.0)
+            w.text(f"remaining: {remaining:.3f} s")
+        else:
+            progress_fraction = 0.0
+            w.text("remaining: --")
+        bar_length = 24
+        filled = min(bar_length, max(0, int(round(progress_fraction * bar_length))))
+        bar = "#" * filled + "-" * (bar_length - filled)
+        w.text(f"progress: [{bar}] {progress_fraction * 100:.1f}%")
+        if timeline_duration > 0.0 and simulation_time >= timeline_duration:
+            status_suffix = " (auto paused)" if timeline_auto_pause and paused else ""
+            w.text(f"timeline reached target{status_suffix}")
+        sim_fps = sim_frame_count / simulation_time if simulation_time > 1e-6 else 0.0
+        substep_rate = sim_substep_count / simulation_time if simulation_time > 1e-6 else 0.0
+        w.text(f"frames: {sim_frame_count} ({sim_fps:.1f} fps)")
+        w.text(f"substeps: {sim_substep_count} ({substep_rate:.1f}/s)")
+        timeline_auto_pause = w.checkbox("auto pause at end", timeline_auto_pause)
+        if w.button("reset timeline"):
+            reset_timeline()
 
     with gui.sub_window("Options", 0.05, 0.45, 0.2, 0.4) as w:
         use_random_colors = w.checkbox("use_random_colors", use_random_colors)
@@ -969,6 +1016,7 @@ def render():
 
 
 def main():
+    global simulation_time, sim_frame_count, sim_substep_count, paused, timeline_auto_pause
     frame_id = 0
 
     while window.running:
@@ -979,6 +1027,12 @@ def main():
         if not paused:
             for _ in range(steps):
                 substep(*GRAVITY)
+            simulation_time += steps * dt
+            sim_substep_count += steps
+            sim_frame_count += 1
+            if timeline_auto_pause and timeline_duration > 0.0 and simulation_time >= timeline_duration:
+                simulation_time = min(simulation_time, timeline_duration)
+                paused = True
 
         render()
         show_options()
