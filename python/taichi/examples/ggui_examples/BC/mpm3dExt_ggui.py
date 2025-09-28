@@ -3,7 +3,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
@@ -512,7 +512,24 @@ def _scene_object_summary(scene_object) -> str:
     material = getattr(scene_object, "material", "?")
     ident = getattr(scene_object, "scene_id", getattr(scene_object, "id", "object"))
     pivot = getattr(scene_object, "pivot", (0.5, 0.0, 0.5))
-    return f"{ident} [{material}] pivot={pivot}"
+    shape_type = getattr(scene_object, "obj_type", getattr(scene_object, "shape_type", "?"))
+    extra = ""
+    if shape_type == "sphere":
+        radius = getattr(scene_object, "radius", None)
+        if radius is not None:
+            try:
+                extra = f" r={float(radius):.3f}"
+            except Exception:
+                extra = ""
+    elif shape_type == "cube_volume":
+        size = getattr(scene_object, "size", None)
+        if size is not None:
+            try:
+                sx, sy, sz = float(size[0]), float(size[1]), float(size[2])
+                extra = f" size=({sx:.3f}, {sy:.3f}, {sz:.3f})"
+            except Exception:
+                extra = ""
+    return f"{ident} [{material}] {shape_type}{extra} pivot={pivot}"
 
 
 
@@ -526,13 +543,17 @@ def build_pivot_debug_geometry(scene_entry) -> tuple[Optional[np.ndarray], dict[
     if scene_entry is None:
         return None, {"x": None, "y": None, "z": None}
 
-    for volume in scene_entry.volumes:
-        size_vec = vector_to_np(volume.size)
+    for shape in scene_entry.shapes:
+        size_attr = getattr(shape, "size", None)
+        minimum_attr = getattr(shape, "minimum", None)
+        if size_attr is None or minimum_attr is None:
+            continue
+        size_vec = vector_to_np(size_attr)
         if not np.all(size_vec > 0):
             continue
-        min_vec = vector_to_np(volume.minimum)
-        pivot_rel = np.array(volume.pivot, dtype=np.float32)
-        rotation = euler_to_rotation_matrix(volume.rotation)
+        min_vec = vector_to_np(minimum_attr)
+        pivot_rel = np.array(getattr(shape, "pivot", (0.5, 0.5, 0.5)), dtype=np.float32)
+        rotation = euler_to_rotation_matrix(getattr(shape, "rotation", (0.0, 0.0, 0.0)))
         pivot_world = min_vec + size_vec * pivot_rel
 
         corners = np.array(
@@ -589,6 +610,7 @@ def build_pivot_debug_geometry(scene_entry) -> tuple[Optional[np.ndarray], dict[
     return bbox_np, axis_np
 
 
+
 def rebuild_pivot_debug_geometry():
     global pivot_bbox_vertices, pivot_axis_vertices
     global pivot_bbox_vertex_count, pivot_axis_vertex_counts
@@ -630,11 +652,41 @@ def rebuild_pivot_debug_geometry():
 
 def _build_scene_entry_from_definition(definition) -> Optional["SceneEntry"]:
     warnings = list(getattr(definition, "warnings", []))
-    volumes: List[CubeVolume] = []
+    shapes: List[SceneShape] = []
     summaries: List[str] = []
 
     for obj in getattr(definition, "objects", []):
         material_id = _resolve_material(getattr(obj, "material", "WATER"), warnings)
+        obj_type = getattr(obj, "obj_type", "cube_volume")
+        if obj_type == "sphere":
+            center_data = getattr(obj, "center", None)
+            radius_data = getattr(obj, "radius", None)
+            if center_data is None or radius_data is None:
+                warnings.append(f"sphere '{getattr(obj, 'scene_id', '?')}' missing center or radius; skipped")
+                continue
+            try:
+                center = domain_vector(center_data)
+                radius = domain_scalar(radius_data)
+            except Exception:
+                warnings.append(f"sphere '{getattr(obj, 'scene_id', '?')}' failed to convert center/radius; skipped")
+                continue
+            rotation = getattr(obj, "rotation_euler", (0.0, 0.0, 0.0))
+            velocity = getattr(obj, "initial_velocity", (0.0, 0.0, 0.0))
+            pivot = getattr(obj, "pivot", (0.5, 0.5, 0.5))
+            shapes.append(
+                SphereVolume(
+                    center=center,
+                    radius=radius,
+                    material=material_id,
+                    rotation=rotation,
+                    initial_velocity=velocity,
+                    pivot=pivot,
+                    color_override=getattr(obj, "color_override", None),
+                )
+            )
+            summaries.append(_scene_object_summary(obj))
+            continue
+
         try:
             minimum = domain_vector(getattr(obj, "position"))
             size = domain_vector(getattr(obj, "size"))
@@ -643,7 +695,7 @@ def _build_scene_entry_from_definition(definition) -> Optional["SceneEntry"]:
             continue
         rotation = getattr(obj, "rotation_euler", (0.0, 0.0, 0.0))
         velocity = getattr(obj, "initial_velocity", (0.0, 0.0, 0.0))
-        volumes.append(
+        shapes.append(
             CubeVolume(
                 minimum=minimum,
                 size=size,
@@ -651,6 +703,7 @@ def _build_scene_entry_from_definition(definition) -> Optional["SceneEntry"]:
                 rotation=rotation,
                 initial_velocity=velocity,
                 pivot=getattr(obj, "pivot", (0.5, 0.0, 0.5)),
+                color_override=getattr(obj, "color_override", None),
             )
         )
         summaries.append(_scene_object_summary(obj))
@@ -679,19 +732,20 @@ def _build_scene_entry_from_definition(definition) -> Optional["SceneEntry"]:
     title = getattr(definition, "title", getattr(definition, "key", "Scene"))
     description = getattr(definition, "description", "")
 
-    if not volumes:
+    if not shapes:
         warnings.append("scene contains no usable objects")
         return None
 
     return SceneEntry(
         title=title,
         description=description,
-        volumes=volumes,
+        shapes=shapes,
         overrides=overrides,
         warnings=warnings,
         source=source or "(inline)",
         object_summaries=summaries,
     )
+
 
 
 
@@ -799,23 +853,48 @@ def substep(g_x: float, g_y: float, g_z: float):
 
 
 class CubeVolume:
-    def __init__(self, minimum, size, material, rotation=None, initial_velocity=None, pivot=None):
+    def __init__(self, minimum, size, material, rotation=None, initial_velocity=None, pivot=None, color_override=None):
+        self.shape_type = "cube_volume"
         self.minimum = minimum
         self.size = size
-        self.volume = self.size.x * self.size.y * self.size.z
         self.material = material
         self.rotation = tuple(rotation) if rotation is not None else (0.0, 0.0, 0.0)
         self.initial_velocity = tuple(initial_velocity) if initial_velocity is not None else (0.0, 0.0, 0.0)
         if pivot is None:
             pivot = (0.5, 0.0, 0.5)
         self.pivot = tuple(pivot)
+        self.color_override = color_override
+        self.volume = float(self.size.x * self.size.y * self.size.z)
+
+
+class SphereVolume:
+    def __init__(self, center, radius, material, rotation=None, initial_velocity=None, pivot=None, color_override=None):
+        self.shape_type = "sphere"
+        self.center = center
+        self.radius = float(radius)
+        self.material = material
+        self.rotation = tuple(rotation) if rotation is not None else (0.0, 0.0, 0.0)
+        self.initial_velocity = tuple(initial_velocity) if initial_velocity is not None else (0.0, 0.0, 0.0)
+        if pivot is None:
+            pivot = (0.5, 0.5, 0.5)
+        self.pivot = tuple(pivot)
+        self.color_override = color_override
+        diameter = self.radius * 2.0
+        self.size = ti.Vector([diameter, diameter, diameter])
+        radius_vec = ti.Vector([self.radius, self.radius, self.radius])
+        self.minimum = center - radius_vec
+        self.volume = float((4.0 / 3.0) * math.pi * (self.radius ** 3))
+
+
+SceneShape = Union["CubeVolume", "SphereVolume"]
+
 
 
 @dataclass
 class SceneEntry:
     title: str
     description: str
-    volumes: List["CubeVolume"]
+    shapes: List["SceneShape"]
     overrides: Dict[str, object]
     warnings: List[str]
     source: str
@@ -867,6 +946,41 @@ def init_cube_vol(
         F_colors_random[i] = ti.Vector([ti.random(), ti.random(), ti.random(), ti.random()])
         F_used[i] = 1
 
+@ti.kernel
+def init_sphere(
+    first_par: int,
+    last_par: int,
+    center_x: float,
+    center_y: float,
+    center_z: float,
+    radius: float,
+    material: int,
+    vel_x: float,
+    vel_y: float,
+    vel_z: float,
+):
+    center = ti.Vector([center_x, center_y, center_z])
+    for i in range(first_par, last_par):
+        cos_phi = 2.0 * ti.random(dtype=float) - 1.0
+        theta = 2.0 * math.pi * ti.random(dtype=float)
+        sin_phi = ti.sqrt(ti.max(0.0, 1.0 - cos_phi * cos_phi))
+        direction = ti.Vector([
+            sin_phi * ti.cos(theta),
+            sin_phi * ti.sin(theta),
+            cos_phi,
+        ])
+        radius_scale = ti.pow(ti.random(dtype=float), 1.0 / 3.0)
+        position = center + direction * (radius * radius_scale)
+        F_x[i] = position
+        F_Jp[i] = 1
+        F_dg[i] = ti.Matrix([[1, 0, 0], [0, 1, 0], [0, 0, 1]])
+        F_v[i] = ti.Vector([vel_x, vel_y, vel_z])
+        F_materials[i] = material
+        F_colors_random[i] = ti.Vector([ti.random(), ti.random(), ti.random(), ti.random()])
+        F_used[i] = 1
+
+
+
 
 @ti.kernel
 def set_all_unused():
@@ -880,30 +994,40 @@ def set_all_unused():
         F_v[p] = ti.Vector([0.0, 0.0, 0.0])
 
 
-def init_vols(vols):
+def init_vols(shapes: List[SceneShape]):
     set_all_unused()
-    total_vol = 0
-    for v in vols:
-        total_vol += v.volume
+    if not shapes:
+        return
+
+    volume_weights = [max(getattr(shape, "volume", 0.0), 0.0) for shape in shapes]
+    total_weight = sum(volume_weights)
+    if total_weight <= 0.0:
+        volume_weights = [1.0 for _ in shapes]
+        total_weight = float(len(shapes))
 
     next_p = 0
-    for i, v in enumerate(vols):
-        v = vols[i]
-        if isinstance(v, CubeVolume):
-            par_count = int(v.volume / total_vol * n_particles)
-            if i == len(vols) - 1:  # this is the last volume, so use all remaining particles
-                par_count = n_particles - next_p
-            rot_mat = euler_to_rotation_matrix(v.rotation)
+    for index, shape in enumerate(shapes):
+        if total_weight > 0.0:
+            par_count = int(volume_weights[index] / total_weight * n_particles)
+        else:
+            par_count = n_particles // len(shapes)
+        if index == len(shapes) - 1:
+            par_count = n_particles - next_p
+        if par_count <= 0:
+            continue
+
+        if isinstance(shape, CubeVolume):
+            rot_mat = euler_to_rotation_matrix(shape.rotation)
             init_cube_vol(
                 next_p,
                 next_p + par_count,
-                float(v.minimum[0]),
-                float(v.minimum[1]),
-                float(v.minimum[2]),
-                float(v.size[0]),
-                float(v.size[1]),
-                float(v.size[2]),
-                v.material,
+                float(shape.minimum[0]),
+                float(shape.minimum[1]),
+                float(shape.minimum[2]),
+                float(shape.size[0]),
+                float(shape.size[1]),
+                float(shape.size[2]),
+                shape.material,
                 float(rot_mat[0, 0]),
                 float(rot_mat[0, 1]),
                 float(rot_mat[0, 2]),
@@ -913,16 +1037,30 @@ def init_vols(vols):
                 float(rot_mat[2, 0]),
                 float(rot_mat[2, 1]),
                 float(rot_mat[2, 2]),
-                float(v.initial_velocity[0]),
-                float(v.initial_velocity[1]),
-                float(v.initial_velocity[2]),
-                float(v.pivot[0]),
-                float(v.pivot[1]),
-                float(v.pivot[2]),
+                float(shape.initial_velocity[0]),
+                float(shape.initial_velocity[1]),
+                float(shape.initial_velocity[2]),
+                float(shape.pivot[0]),
+                float(shape.pivot[1]),
+                float(shape.pivot[2]),
             )
-            next_p += par_count
+        elif isinstance(shape, SphereVolume):
+            init_sphere(
+                next_p,
+                next_p + par_count,
+                float(shape.center[0]),
+                float(shape.center[1]),
+                float(shape.center[2]),
+                float(shape.radius),
+                shape.material,
+                float(shape.initial_velocity[0]),
+                float(shape.initial_velocity[1]),
+                float(shape.initial_velocity[2]),
+            )
         else:
-            raise Exception("???")
+            continue
+
+        next_p += par_count
 
 
 @ti.kernel
@@ -1025,7 +1163,7 @@ def init():
         print("[mpm3dExt] No scenes available to initialize.")
         return
     current_scene = scene_entries[curr_scene_id]
-    init_vols(current_scene.volumes)
+    init_vols(current_scene.shapes)
     if not use_random_colors:
         set_color_by_material(np.array(material_colors, dtype=np.float32))
 
@@ -1217,7 +1355,7 @@ def show_options():
             if active_scene.description:
                 for line in active_scene.description.splitlines():
                     w.text(line[:64])
-            w.text(f"objects: {len(active_scene.volumes)}")
+            w.text(f"objects: {len(active_scene.shapes)}")
             max_listed = 3
             for summary in active_scene.object_summaries[:max_listed]:
                 w.text(f"- {summary}")
@@ -1390,4 +1528,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
