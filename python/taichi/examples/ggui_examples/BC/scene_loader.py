@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 SCENE_FILE_SUFFIX = ".mpm.json"
+DEFAULT_PIVOT = (0.5, 0.0, 0.5)
 
 
 @dataclass
@@ -19,6 +20,7 @@ class SceneObject:
     size: Tuple[float, float, float]
     rotation_euler: Tuple[float, float, float]
     initial_velocity: Tuple[float, float, float]
+    pivot: Tuple[float, float, float]
     color_override: Optional[Tuple[float, float, float]] = None
 
 
@@ -55,6 +57,17 @@ def _to_vec3(values: Sequence[object], name: str, warnings: List[str], default: 
         warnings.append(f"'{name}' contains non-numeric values; using default {default}")
         return default
     return vec  # type: ignore[return-value]
+
+def _clamp_relative_vec(vec: Tuple[float, float, float], name: str, warnings: List[str]) -> Tuple[float, float, float]:
+    clamped = []
+    for i, value in enumerate(vec):
+        clamped_value = value
+        if value < 0.0 or value > 1.0:
+            clamped_value = min(max(value, 0.0), 1.0)
+            axis = "xyz"[i] if i < 3 else str(i)
+            warnings.append(f"'{name}' component {axis}={value:.3f} clamped to {clamped_value:.3f}")
+        clamped.append(clamped_value)
+    return tuple(clamped)  # type: ignore[return-value]
 
 
 def _load_scene_file(path: Path) -> Optional[SceneDefinition]:
@@ -108,6 +121,8 @@ def _load_scene_file(path: Path) -> Optional[SceneDefinition]:
         size = _to_vec3(obj_data.get("size"), "size", warnings, (0.2, 0.2, 0.2))
         rotation = _to_vec3(obj_data.get("rotation_euler"), "rotation_euler", warnings, (0.0, 0.0, 0.0), allow_missing=True)
         velocity = _to_vec3(obj_data.get("initial_velocity"), "initial_velocity", warnings, (0.0, 0.0, 0.0), allow_missing=True)
+        pivot_raw = _to_vec3(obj_data.get("pivot"), "pivot", warnings, DEFAULT_PIVOT, allow_missing=True)
+        pivot = _clamp_relative_vec(pivot_raw, "pivot", warnings)
         color_override = obj_data.get("color_override")
         if color_override is not None:
             color = _to_vec3(color_override, "color_override", warnings, (0.0, 0.0, 0.0), allow_missing=True)
@@ -123,6 +138,7 @@ def _load_scene_file(path: Path) -> Optional[SceneDefinition]:
                 size=size,
                 rotation_euler=rotation,
                 initial_velocity=velocity,
+                pivot=pivot,
                 color_override=color_override_tuple,
             )
         )

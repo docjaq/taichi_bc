@@ -501,7 +501,8 @@ def _sanitize_override_vec3(value: object, name: str, warning_sink: List[str]) -
 def _scene_object_summary(scene_object) -> str:
     material = getattr(scene_object, "material", "?")
     ident = getattr(scene_object, "scene_id", getattr(scene_object, "id", "object"))
-    return f"{ident} [{material}]"
+    pivot = getattr(scene_object, "pivot", (0.5, 0.0, 0.5))
+    return f"{ident} [{material}] pivot={pivot}"
 
 
 def _build_scene_entry_from_definition(definition) -> Optional["SceneEntry"]:
@@ -526,6 +527,7 @@ def _build_scene_entry_from_definition(definition) -> Optional["SceneEntry"]:
                 material=material_id,
                 rotation=rotation,
                 initial_velocity=velocity,
+                pivot=getattr(obj, "pivot", (0.5, 0.0, 0.5)),
             )
         )
         summaries.append(_scene_object_summary(obj))
@@ -674,13 +676,16 @@ def substep(g_x: float, g_y: float, g_z: float):
 
 
 class CubeVolume:
-    def __init__(self, minimum, size, material, rotation=None, initial_velocity=None):
+    def __init__(self, minimum, size, material, rotation=None, initial_velocity=None, pivot=None):
         self.minimum = minimum
         self.size = size
         self.volume = self.size.x * self.size.y * self.size.z
         self.material = material
         self.rotation = tuple(rotation) if rotation is not None else (0.0, 0.0, 0.0)
         self.initial_velocity = tuple(initial_velocity) if initial_velocity is not None else (0.0, 0.0, 0.0)
+        if pivot is None:
+            pivot = (0.5, 0.0, 0.5)
+        self.pivot = tuple(pivot)
 
 
 @dataclass
@@ -692,6 +697,7 @@ class SceneEntry:
     warnings: List[str]
     source: str
     object_summaries: List[str]
+
 
 
 @ti.kernel
@@ -717,13 +723,20 @@ def init_cube_vol(
     vel_x: float,
     vel_y: float,
     vel_z: float,
+    pivot_x: float,
+    pivot_y: float,
+    pivot_z: float,
 ):
     rotation = ti.Matrix([[r00, r01, r02], [r10, r11, r12], [r20, r21, r22]])
-    center = ti.Vector([x_begin + 0.5 * x_size, y_begin + 0.5 * y_size, z_begin + 0.5 * z_size])
+    min_vec = ti.Vector([x_begin, y_begin, z_begin])
+    size_vec = ti.Vector([x_size, y_size, z_size])
+    pivot_vec = ti.Vector([pivot_x, pivot_y, pivot_z])
+    pivot_world = min_vec + size_vec * pivot_vec
     for i in range(first_par, last_par):
-        local = (ti.Vector([ti.random() for _ in range(dim)]) - 0.5) * ti.Vector([x_size, y_size, z_size])
+        random_vec = ti.Vector([ti.random() for _ in range(dim)])
+        local = (random_vec - pivot_vec) * size_vec
         rotated = rotation @ local
-        F_x[i] = rotated + center
+        F_x[i] = rotated + pivot_world
         F_Jp[i] = 1
         F_dg[i] = ti.Matrix([[1, 0, 0], [0, 1, 0], [0, 0, 1]])
         F_v[i] = ti.Vector([vel_x, vel_y, vel_z])
@@ -780,6 +793,9 @@ def init_vols(vols):
                 float(v.initial_velocity[0]),
                 float(v.initial_velocity[1]),
                 float(v.initial_velocity[2]),
+                float(v.pivot[0]),
+                float(v.pivot[1]),
+                float(v.pivot[2]),
             )
             next_p += par_count
         else:
