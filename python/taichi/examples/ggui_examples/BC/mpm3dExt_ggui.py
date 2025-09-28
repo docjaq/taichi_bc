@@ -16,10 +16,9 @@ if str(CURRENT_DIR) not in sys.path:
     sys.path.insert(0, str(CURRENT_DIR))
 
 try:
-    from scene_loader import SceneDefinition, load_scenes
+    from scene_loader import load_scenes
 except Exception as exc:
     load_scenes = None
-    SceneDefinition = None
     print(f"[mpm3dExt] Warning: unable to import scene_loader: {exc}")
 
 AXIS_LABEL_COLOR = (0.95, 0.95, 0.95)
@@ -570,22 +569,6 @@ def _build_scene_entry_from_definition(definition) -> Optional["SceneEntry"]:
     )
 
 
-def _build_legacy_scene_entries() -> List["SceneEntry"]:
-    entries: List["SceneEntry"] = []
-    for name, volumes in zip(legacy_preset_names, legacy_presets):
-        entries.append(
-            SceneEntry(
-                title=f"Legacy - {name}",
-                description="Built-in preset previously hard-coded in the demo.",
-                volumes=volumes,
-                overrides={},
-                warnings=[],
-                source="legacy",
-                object_summaries=[f"preset with {len(volumes)} volume(s)"],
-            )
-        )
-    return entries
-
 
 @ti.kernel
 def substep(g_x: float, g_y: float, g_z: float):
@@ -817,54 +800,16 @@ def set_color_by_material(mat_color: ti.types.ndarray()):
 
 print("Loading scenes...this might take a minute")
 
-legacy_presets = [
-    [
-        CubeVolume(domain_vector([0.55, 0.05, 0.55]), domain_vector([0.4, 0.4, 0.4]), WATER),
-    ],
-    [
-        CubeVolume(domain_vector([0.05, 0.05, 0.05]), domain_vector([0.3, 0.4, 0.3]), WATER),
-        CubeVolume(domain_vector([0.65, 0.05, 0.65]), domain_vector([0.3, 0.4, 0.3]), WATER),
-    ],
-    [
-        CubeVolume(domain_vector([0.6, 0.05, 0.6]), domain_vector([0.25, 0.25, 0.25]), WATER),
-        CubeVolume(domain_vector([0.35, 0.35, 0.35]), domain_vector([0.25, 0.25, 0.25]), SNOW),
-        CubeVolume(domain_vector([0.05, 0.6, 0.05]), domain_vector([0.25, 0.25, 0.25]), JELLY),
-    ],
-    [
-        CubeVolume(domain_vector([0.6, 0.05, 0.6]), domain_vector([0.25, 0.25, 0.25]), JELLY),
-        #CubeVolume(domain_vector([0.35, 0.35, 0.35]), domain_vector([0.25, 0.25, 0.25]), SNOW),
-        CubeVolume(domain_vector([0.6, 0.8, 0.6]), domain_vector([0.15, 0.15, 0.15]), CONCRETE),
-        CubeVolume(domain_vector([0.3, 0.8, 0.3]), domain_vector([0.15, 0.15, 0.15]), CONCRETE),
-    ],
-    [
-        CubeVolume(
-            domain_vector([SIDE_MARGIN_REL, RELATIVE_BOUNDARY_MARGIN, SIDE_MARGIN_REL]),
-            domain_vector([1.0 - 2.0 * SIDE_MARGIN_REL, 0.15, 1.0 - 2.0 * SIDE_MARGIN_REL]),
-            SNOW,
-        ),
-        CubeVolume(
-            domain_vector([SIDE_MARGIN_REL + 0.08, RELATIVE_BOUNDARY_MARGIN + 0.55, SIDE_MARGIN_REL + 0.08]),
-            domain_vector([0.2, 0.2, 0.2]),
-            CONCRETE,
-            rotation=(0.0, math.radians(20.0), 0.0),
-            initial_velocity=(1.0, -5.0, 1.0),
-        ),
-    ],
-]
-legacy_preset_names = [
-    "Single Dam Break",
-    "Double Dam Break",
-    "Water Snow Jelly",
-    "Jelly Snow Concrete",
-    "Snow Cushion Drop",
-]
 
 scene_dir = CURRENT_DIR / "scenes"
 scene_entries: List["SceneEntry"] = []
 scene_loader_messages: List[str] = []
 
 if load_scenes is not None:
-    for definition in load_scenes(scene_dir):
+    definitions = load_scenes(scene_dir)
+    if not definitions:
+        scene_loader_messages.append("No scenes found in scenes/.")
+    for definition in definitions:
         entry = _build_scene_entry_from_definition(definition)
         if entry is None:
             label = getattr(definition, "title", getattr(definition, "key", str(definition)))
@@ -873,14 +818,10 @@ if load_scenes is not None:
         scene_entries.append(entry)
         for warning in entry.warnings:
             scene_loader_messages.append(f"[{entry.title}] {warning}")
+    if scene_entries:
+        scene_loader_messages.append(f"Loaded {len(scene_entries)} scene(s).")
 else:
-    scene_loader_messages.append("Scene loader unavailable; using built-in presets only.")
-
-if not scene_entries:
-    scene_loader_messages.append("No JSON scenes loaded; falling back to legacy presets.")
-    scene_entries = _build_legacy_scene_entries()
-else:
-    scene_entries.extend(_build_legacy_scene_entries())
+    scene_loader_messages.append("Scene loader unavailable; cannot load scenes.")
 
 scene_names = [entry.title for entry in scene_entries]
 curr_scene_id = 0
@@ -935,6 +876,9 @@ def apply_scene_overrides(scene_entry: SceneEntry):
 def init():
     global paused
     reset_timeline()
+    if not scene_entries:
+        print("[mpm3dExt] No scenes available to initialize.")
+        return
     current_scene = scene_entries[curr_scene_id]
     init_vols(current_scene.volumes)
     if not use_random_colors:

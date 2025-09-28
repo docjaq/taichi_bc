@@ -1,8 +1,8 @@
 {
   "meta": {
-    "title": "Single Water Block",
-    "description": "One water volume suspended above the floor for quick smoke tests.",
-    "tags": ["demo", "water"]
+    "title": "Single Dam Break",
+    "description": "Single block of water suspended above the ground plane.",
+    "tags": ["water", "baseline"]
   },
   "simulation": {
     "gravity": [0.0, -9.81, 0.0],
