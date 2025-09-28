@@ -3,7 +3,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -32,6 +32,7 @@ AXIS_LABEL_DEPTH_OFFSET_FACTOR = 0.006
 AXIS_LABEL_OFFSET_FACTOR = 0.035
 AXIS_LABEL_X_PADDING = 1.35
 AXIS_LABEL_Z_PADDING = 1.2
+
 
 # Stability configuration
 CFL_NUMBER_BASE = 0.5
@@ -62,6 +63,15 @@ POISSON_RATIO = 0.2
 DEFAULT_GRAVITY = [0.0, -9.81, 0.0]  # m/s^2
 GRAVITY = list(DEFAULT_GRAVITY)
 BOUNDARY_CELLS = 3
+
+PIVOT_BBOX_COLOR = (0.95, 0.85, 0.2)
+PIVOT_AXIS_COLORS = {
+    "x": (0.9, 0.3, 0.3),
+    "y": (0.3, 0.8, 0.3),
+    "z": (0.3, 0.4, 0.9),
+}
+PIVOT_AXIS_LENGTH_MIN = 0.02 * SIMULATION_LENGTH
+PIVOT_AXIS_LENGTH_MAX = 0.2 * SIMULATION_LENGTH
 
 BASE_WATER_STIFFNESS_MULTIPLIER = 1.5
 BASE_JELLY_HARDENING = 0.35
@@ -505,6 +515,119 @@ def _scene_object_summary(scene_object) -> str:
     return f"{ident} [{material}] pivot={pivot}"
 
 
+
+def vector_to_np(vec) -> np.ndarray:
+    return np.array([float(vec[0]), float(vec[1]), float(vec[2])], dtype=np.float32)
+
+
+def build_pivot_debug_geometry(scene_entry) -> tuple[Optional[np.ndarray], dict[str, Optional[np.ndarray]]]:
+    bbox_vertices: list[np.ndarray] = []
+    axis_vertices = {"x": [], "y": [], "z": []}
+    if scene_entry is None:
+        return None, {"x": None, "y": None, "z": None}
+
+    for volume in scene_entry.volumes:
+        size_vec = vector_to_np(volume.size)
+        if not np.all(size_vec > 0):
+            continue
+        min_vec = vector_to_np(volume.minimum)
+        pivot_rel = np.array(volume.pivot, dtype=np.float32)
+        rotation = euler_to_rotation_matrix(volume.rotation)
+        pivot_world = min_vec + size_vec * pivot_rel
+
+        corners = np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [1.0, 0.0, 1.0],
+                [0.0, 0.0, 1.0],
+                [0.0, 1.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [1.0, 1.0, 1.0],
+                [0.0, 1.0, 1.0],
+            ],
+            dtype=np.float32,
+        )
+        corners_world = []
+        for corner in corners:
+            local = (corner - pivot_rel) * size_vec
+            world = rotation @ local + pivot_world
+            corners_world.append(world.astype(np.float32))
+
+        edges = [
+            (0, 1), (1, 2), (2, 3), (3, 0),
+            (4, 5), (5, 6), (6, 7), (7, 4),
+            (0, 4), (1, 5), (2, 6), (3, 7),
+        ]
+        for a, b in edges:
+            bbox_vertices.append(corners_world[a])
+            bbox_vertices.append(corners_world[b])
+
+        axis_length = max(size_vec.max() * 0.3, PIVOT_AXIS_LENGTH_MIN)
+        axis_length = min(axis_length, PIVOT_AXIS_LENGTH_MAX)
+        if axis_length <= 0:
+            axis_length = PIVOT_AXIS_LENGTH_MIN
+
+        axis_local = [
+            np.array([axis_length, 0.0, 0.0], dtype=np.float32),
+            np.array([0.0, axis_length, 0.0], dtype=np.float32),
+            np.array([0.0, 0.0, axis_length], dtype=np.float32),
+        ]
+        for key, direction in zip(("x", "y", "z"), axis_local):
+            end = rotation @ direction + pivot_world
+            axis_vertices[key].append(pivot_world.astype(np.float32))
+            axis_vertices[key].append(end.astype(np.float32))
+
+    if not bbox_vertices:
+        return None, {"x": None, "y": None, "z": None}
+
+    bbox_np = np.array(bbox_vertices, dtype=np.float32)
+    axis_np = {
+        key: (np.array(values, dtype=np.float32) if values else None)
+        for key, values in axis_vertices.items()
+    }
+    return bbox_np, axis_np
+
+
+def rebuild_pivot_debug_geometry():
+    global pivot_bbox_vertices, pivot_axis_vertices
+    global pivot_bbox_vertex_count, pivot_axis_vertex_counts
+    if not scene_entries or curr_scene_id >= len(scene_entries):
+        pivot_bbox_vertices = None
+        pivot_axis_vertices = {"x": None, "y": None, "z": None}
+        pivot_bbox_vertex_count = 0
+        pivot_axis_vertex_counts = {"x": 0, "y": 0, "z": 0}
+        return
+
+    bbox_np, axis_np = build_pivot_debug_geometry(scene_entries[curr_scene_id])
+
+    if bbox_np is not None and bbox_np.size > 0:
+        pivot_bbox_vertex_count = bbox_np.shape[0]
+        pivot_bbox_vertices = ti.Vector.field(3, float, pivot_bbox_vertex_count)
+        pivot_bbox_vertices.from_numpy(bbox_np)
+    else:
+        pivot_bbox_vertices = None
+        pivot_bbox_vertex_count = 0
+
+    axis_fields: Dict[str, Optional[Any]] = {}
+    axis_counts: Dict[str, int] = {}
+    for axis_key in ("x", "y", "z"):
+        axis_arr = None
+        if axis_np:
+            axis_arr = axis_np.get(axis_key)
+        if axis_arr is not None and axis_arr.size > 0:
+            axis_counts[axis_key] = axis_arr.shape[0]
+            axis_field = ti.Vector.field(3, float, axis_arr.shape[0])
+            axis_field.from_numpy(axis_arr)
+            axis_fields[axis_key] = axis_field
+        else:
+            axis_counts[axis_key] = 0
+            axis_fields[axis_key] = None
+
+    pivot_axis_vertices = axis_fields
+    pivot_axis_vertex_counts = axis_counts
+
+
 def _build_scene_entry_from_definition(definition) -> Optional["SceneEntry"]:
     warnings = list(getattr(definition, "warnings", []))
     volumes: List[CubeVolume] = []
@@ -849,6 +972,12 @@ show_world_grid = False
 show_simulation_grid = False
 particles_radius = DEFAULT_PARTICLE_RADIUS
 
+show_object_gizmos = False
+pivot_bbox_vertices: Optional[Any] = None
+pivot_axis_vertices: Dict[str, Optional[Any]] = {"x": None, "y": None, "z": None}
+pivot_bbox_vertex_count = 0
+pivot_axis_vertex_counts: Dict[str, int] = {"x": 0, "y": 0, "z": 0}
+
 # Simulation timeline state
 DEFAULT_TIMELINE_DURATION = 10.0
 timeline_duration = DEFAULT_TIMELINE_DURATION
@@ -902,12 +1031,18 @@ def init():
 
 
 def load_scene(index: int):
-    global curr_scene_id
+    global curr_scene_id, pivot_bbox_vertices, pivot_axis_vertices
+    global pivot_bbox_vertex_count, pivot_axis_vertex_counts
     if not scene_entries:
+        pivot_bbox_vertices = None
+        pivot_axis_vertices = {"x": None, "y": None, "z": None}
+        pivot_bbox_vertex_count = 0
+        pivot_axis_vertex_counts = {"x": 0, "y": 0, "z": 0}
         return
     index = max(0, min(index, len(scene_entries) - 1))
     curr_scene_id = index
     apply_scene_overrides(scene_entries[curr_scene_id])
+    rebuild_pivot_debug_geometry()
     init()
 
 
@@ -1058,6 +1193,7 @@ def show_options():
     global curr_scene_id
     global show_world_grid
     global show_simulation_grid
+    global show_object_gizmos
     global timeline_duration
     global timeline_auto_pause
     global simulation_time
@@ -1169,6 +1305,7 @@ def show_options():
     with gui.sub_window("World Grid", 0.75, 0.45, 0.2, 0.22) as w:
         show_world_grid = w.checkbox("show world grid", show_world_grid)
         show_simulation_grid = w.checkbox("show simulation grid", show_simulation_grid)
+        show_object_gizmos = w.checkbox("show object gizmos", show_object_gizmos)
         w.text(f"domain: 0-{SIMULATION_LENGTH:.2f} m")
         w.text(f"grid: {n_grid}^3 cells")
         w.text(f"dx: {dx:.4e} m")
@@ -1180,11 +1317,15 @@ def show_options():
                 w.text(", ".join(tick_preview[:midpoint]))
                 if midpoint < len(tick_preview):
                     w.text(", ".join(tick_preview[midpoint:]))
+        if show_object_gizmos:
+            if pivot_bbox_vertex_count > 0:
+                w.text(f"object gizmo edges: {pivot_bbox_vertex_count // 2}")
+            else:
+                w.text("object gizmos: none")
         if show_simulation_grid and simulation_grid_line_count:
             w.text(f"sim lines: {simulation_grid_line_count}")
         if (show_world_grid or show_simulation_grid) and axis_label_line_count:
             w.text(f"label strokes: {axis_label_line_count}")
-
 
 def render():
     camera_controller.update(window)
@@ -1204,6 +1345,15 @@ def render():
         scene.lines(axis_x_vertices, width=2.0, color=(0.9, 0.3, 0.3))
         scene.lines(axis_y_vertices, width=2.0, color=(0.3, 0.8, 0.3))
         scene.lines(axis_z_vertices, width=2.0, color=(0.3, 0.4, 0.9))
+
+    if show_object_gizmos:
+        if pivot_bbox_vertices is not None and pivot_bbox_vertex_count > 0:
+            scene.lines(pivot_bbox_vertices, width=1.0, color=PIVOT_BBOX_COLOR)
+        if isinstance(pivot_axis_vertices, dict):
+            for axis_key, color in PIVOT_AXIS_COLORS.items():
+                verts_field = pivot_axis_vertices.get(axis_key)
+                if verts_field is not None and pivot_axis_vertex_counts.get(axis_key, 0) > 0:
+                    scene.lines(verts_field, width=1.4, color=color)
 
     if show_simulation_grid and simulation_grid_vertices is not None and simulation_grid_vertices.shape[0] > 0:
         scene.lines(simulation_grid_vertices, width=0.8, color=(0.35, 0.45, 0.75))
@@ -1240,3 +1390,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
